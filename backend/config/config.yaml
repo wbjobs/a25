@@ -1,0 +1,33 @@
+server:
+  game_port: 50051
+  match_port: 50052
+  tick_rate: 30
+
+redis:
+  address: "redis:6379"
+  password: ""
+  db: 0
+
+mongodb:
+  uri: "mongodb://mongodb:27017"
+  database: "cardgame"
+
+game:
+  max_health: 20
+  max_mana: 10
+  deck_size: 30
+  starting_hand_size: 3
+  max_hand_size: 10
+  max_board_size: 7
+  fatigue_start_damage: 1
+
+matchmaking:
+  elo_k_factor: 32
+  base_rating: 1000
+  max_wait_time_seconds: 120
+  initial_rating_diff: 50
+  max_rating_diff: 300
+
+logging:
+  level: "debug"
+  format: "json"

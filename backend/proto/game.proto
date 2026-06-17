@@ -1,0 +1,199 @@
+syntax = "proto3";
+
+package game.v1;
+
+option go_package = "github.com/ecscard/game/proto/v1";
+
+enum CardType {
+  CARD_TYPE_UNSPECIFIED = 0;
+  CARD_TYPE_MINION = 1;
+  CARD_TYPE_SPELL = 2;
+  CARD_TYPE_WEAPON = 3;
+}
+
+enum SpellEffect {
+  SPELL_EFFECT_UNSPECIFIED = 0;
+  SPELL_EFFECT_DAMAGE = 1;
+  SPELL_EFFECT_DRAW = 2;
+  SPELL_EFFECT_HEAL = 3;
+  SPELL_EFFECT_BUFF = 4;
+}
+
+enum GameState {
+  GAME_STATE_UNSPECIFIED = 0;
+  GAME_STATE_WAITING = 1;
+  GAME_STATE_PLAYING = 2;
+  GAME_STATE_FINISHED = 3;
+}
+
+enum TurnPhase {
+  TURN_PHASE_UNSPECIFIED = 0;
+  TURN_PHASE_BEGIN = 1;
+  TURN_PHASE_MAIN = 2;
+  TURN_PHASE_END = 3;
+}
+
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  ACTION_TYPE_PLAY_CARD = 1;
+  ACTION_TYPE_ATTACK = 2;
+  ACTION_TYPE_END_TURN = 3;
+  ACTION_TYPE_CONCEDE = 4;
+}
+
+message Card {
+  uint64 entity_id = 1;
+  string card_id = 2;
+  string template_id = 3;
+  CardType type = 4;
+  int32 cost = 5;
+  string name = 6;
+  string description = 7;
+  string rarity = 8;
+  int32 attack = 9;
+  int32 health = 10;
+  int32 max_health = 11;
+  int32 durability = 12;
+  SpellEffect spell_effect = 13;
+  int32 spell_value = 14;
+  bool can_attack = 15;
+  bool taunt = 16;
+  bool charge = 17;
+  bool divine_shield = 18;
+  bool frozen = 19;
+}
+
+message Player {
+  string player_id = 1;
+  string player_name = 2;
+  int32 health = 3;
+  int32 max_health = 4;
+  int32 mana = 5;
+  int32 max_mana = 6;
+  int32 armor = 7;
+  int32 attack = 8;
+  repeated uint64 hand = 9;
+  repeated uint64 board = 10;
+  int32 deck_size = 11;
+  uint64 weapon = 12;
+}
+
+message GameStatus {
+  string game_id = 1;
+  GameState state = 2;
+  int32 turn = 3;
+  string current_turn_player_id = 4;
+  TurnPhase phase = 5;
+  uint64 frame_number = 6;
+  string winner = 7;
+  repeated Player players = 8;
+  repeated Card cards = 9;
+}
+
+message Action {
+  uint64 sequence = 1;
+  ActionType type = 2;
+  string player_id = 3;
+  uint64 frame_number = 4;
+  uint64 card_id = 5;
+  uint64 target_id = 6;
+  int64 timestamp = 7;
+}
+
+message GameEvent {
+  uint64 sequence = 1;
+  string event_type = 2;
+  uint64 frame_number = 3;
+  map<string, string> data = 4;
+  uint64 entity_id = 5;
+  int64 timestamp = 6;
+}
+
+message GameFrame {
+  uint64 frame_number = 1;
+  repeated Action actions = 2;
+  repeated GameEvent events = 3;
+  GameStatus status = 4;
+}
+
+message StartGameRequest {
+  string player1_id = 1;
+  string player1_name = 2;
+  string player2_id = 3;
+  string player2_name = 4;
+  string game_type = 5;
+}
+
+message StartGameResponse {
+  string game_id = 1;
+  GameStatus initial_state = 2;
+}
+
+message PlayCardRequest {
+  string game_id = 1;
+  string player_id = 2;
+  uint64 card_entity_id = 3;
+  uint64 target_entity_id = 4;
+}
+
+message PlayCardResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AttackRequest {
+  string game_id = 1;
+  string player_id = 2;
+  uint64 attacker_entity_id = 3;
+  uint64 target_entity_id = 4;
+}
+
+message AttackResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message EndTurnRequest {
+  string game_id = 1;
+  string player_id = 2;
+}
+
+message EndTurnResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ConcedeRequest {
+  string game_id = 1;
+  string player_id = 2;
+}
+
+message ConcedeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetGameStateRequest {
+  string game_id = 1;
+  string player_id = 2;
+}
+
+message GetGameStateResponse {
+  GameStatus state = 1;
+}
+
+message StreamGameRequest {
+  string game_id = 1;
+  string player_id = 2;
+}
+
+service GameService {
+  rpc StartGame(StartGameRequest) returns (StartGameResponse);
+  rpc PlayCard(PlayCardRequest) returns (PlayCardResponse);
+  rpc Attack(AttackRequest) returns (AttackResponse);
+  rpc EndTurn(EndTurnRequest) returns (EndTurnResponse);
+  rpc Concede(ConcedeRequest) returns (ConcedeResponse);
+  rpc GetGameState(GetGameStateRequest) returns (GetGameStateResponse);
+  rpc StreamGame(StreamGameRequest) returns (stream GameFrame);
+  rpc SendAction(stream Action) returns (stream GameFrame);
+}

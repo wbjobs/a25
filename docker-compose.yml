@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.0-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  mongodb:
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+
+  envoy:
+    image: envoyproxy/envoy:v1.28.0
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
+    depends_on:
+      - game-server
+      - match-server
+
+  game-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.game
+    ports:
+      - "50051:50051"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - MONGO_URI=mongodb://admin:password@mongodb:27017
+    depends_on:
+      - redis
+      - mongodb
+
+  match-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.match
+    ports:
+      - "50052:50052"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - MONGO_URI=mongodb://admin:password@mongodb:27017
+      - GAME_SERVER_ADDR=game-server:50051
+    depends_on:
+      - redis
+      - mongodb
+      - game-server
+
+volumes:
+  redis-data:
+  mongo-data:

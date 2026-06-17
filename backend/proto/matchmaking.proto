@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package match.v1;
+
+option go_package = "github.com/ecscard/game/proto/v1";
+
+enum MatchStatus {
+  MATCH_STATUS_UNSPECIFIED = 0;
+  MATCH_STATUS_IN_QUEUE = 1;
+  MATCH_STATUS_MATCHED = 2;
+  MATCH_STATUS_IN_GAME = 3;
+  MATCH_STATUS_FINISHED = 4;
+  MATCH_STATUS_CANCELLED = 5;
+}
+
+message Player {
+  string player_id = 1;
+  string player_name = 2;
+  int32 rating = 3;
+  int32 wins = 4;
+  int32 losses = 5;
+  string deck_id = 6;
+}
+
+message MatchRequest {
+  Player player = 1;
+  string game_type = 2;
+}
+
+message MatchResponse {
+  string match_id = 1;
+  MatchStatus status = 2;
+  Player opponent = 3;
+  string game_id = 4;
+  string game_server_address = 5;
+}
+
+message CancelMatchRequest {
+  string player_id = 1;
+  string match_id = 2;
+}
+
+message CancelMatchResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetMatchStatusRequest {
+  string player_id = 1;
+  string match_id = 2;
+}
+
+message GetMatchStatusResponse {
+  string match_id = 1;
+  MatchStatus status = 2;
+  Player player1 = 3;
+  Player player2 = 4;
+  string game_id = 5;
+}
+
+message MatchResult {
+  string match_id = 1;
+  string winner_id = 2;
+  string loser_id = 3;
+  int32 turns = 4;
+  int64 duration_ms = 5;
+  bool winner_conceded = 6;
+}
+
+message SubmitMatchResultRequest {
+  MatchResult result = 1;
+}
+
+message SubmitMatchResultResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetPlayerStatsRequest {
+  string player_id = 1;
+}
+
+message GetPlayerStatsResponse {
+  string player_id = 1;
+  int32 rating = 2;
+  int32 wins = 3;
+  int32 losses = 4;
+  int32 win_streak = 5;
+  int32 total_games = 6;
+}
+
+service MatchService {
+  rpc FindMatch(MatchRequest) returns (stream MatchResponse);
+  rpc CancelMatch(CancelMatchRequest) returns (CancelMatchResponse);
+  rpc GetMatchStatus(GetMatchStatusRequest) returns (GetMatchStatusResponse);
+  rpc SubmitMatchResult(SubmitMatchResultRequest) returns (SubmitMatchResultResponse);
+  rpc GetPlayerStats(GetPlayerStatsRequest) returns (GetPlayerStatsResponse);
+}
