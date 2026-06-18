@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/ecscard/game/internal/matchmaking"
-	pb "github.com/ecscard/game/proto/v1"
+	pb "github.com/ecscard/game/internal/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -26,7 +26,7 @@ func NewMatchServer(redisAddr, mongoURI, gameServerAddr string, gameClient pb.Ga
 }
 
 func (s *MatchServer) FindMatch(req *pb.MatchRequest, stream pb.MatchService_FindMatchServer) error {
-	ch, err := s.matchmaker.FindMatch(req.Player, req.GameType)
+	ch, err := s.matchmaker.FindMatch(req.Player, req.GameType, req.IsAiOpponent, req.AiDifficulty)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to join queue: %v", err)
 	}

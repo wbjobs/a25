@@ -2,11 +2,12 @@ package server
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/ecscard/game/internal/ecs"
 	"github.com/ecscard/game/internal/game"
-	pb "github.com/ecscard/game/proto/v1"
+	pb "github.com/ecscard/game/internal/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -17,8 +18,8 @@ type GameServer struct {
 	serverAddr  string
 }
 
-func NewGameServer(redisAddr, mongoURI, serverAddr string) (*GameServer, error) {
-	gm, err := game.NewGameManager(redisAddr, mongoURI)
+func NewGameServer(redisAddr, mongoURI, serverAddr string, useCluster bool, clusterAddrs []string) (*GameServer, error) {
+	gm, err := game.NewGameManager(redisAddr, mongoURI, useCluster, clusterAddrs)
 	if err != nil {
 		return nil, err
 	}
@@ -42,15 +43,22 @@ func (s *GameServer) StartGame(ctx context.Context, req *pb.StartGameRequest) (*
 		req.Player1Name,
 		req.Player2Name,
 		gameType,
+		req.IsAiOpponent,
+		req.AiDifficulty,
 	)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create game: %v", err)
 	}
 
-	return &pb.StartGameResponse{
-		GameId:       gameInstance.GameID,
-		InitialState: gameInstance.GetGameState(req.Player1Id),
-	}, nil
+	resp := &pb.StartGameResponse{
+		GameId:            gameInstance.GameID,
+		InitialState:      gameInstance.GetGameState(req.Player1Id),
+		InitialSnapshot:   gameInstance.GetCurrentSnapshot(),
+		SnapshotIntervalMs: gameInstance.SnapshotInterval(),
+		PlayerAssignedId:   req.Player1Id,
+	}
+
+	return resp, nil
 }
 
 func (s *GameServer) PlayCard(ctx context.Context, req *pb.PlayCardRequest) (*pb.PlayCardResponse, error) {
@@ -59,18 +67,36 @@ func (s *GameServer) PlayCard(ctx context.Context, req *pb.PlayCardRequest) (*pb
 		return nil, status.Errorf(codes.NotFound, "game not found")
 	}
 
-	success := gameInstance.PlayCard(req.PlayerId, ecs.EntityID(req.CardEntityId), ecs.EntityID(req.TargetEntityId))
-	if !success {
-		return &pb.PlayCardResponse{
-			Success: false,
-			Message: "failed to play card",
-		}, nil
+	seq := req.Sequence
+	if seq == 0 {
+		seq = gameInstance.GetPlayerNextSeq(req.PlayerId)
 	}
 
-	return &pb.PlayCardResponse{
-		Success: true,
-		Message: "card played successfully",
-	}, nil
+	success, rollbackSnap := gameInstance.PlayCard(
+		req.PlayerId,
+		ecs.EntityID(req.CardEntityId),
+		ecs.EntityID(req.TargetEntityId),
+		req.BaseSnapshotFrame,
+		req.BaseSnapshotHash,
+		seq,
+	)
+
+	resp := &pb.PlayCardResponse{
+		Success:        success,
+		ConfirmedFrame: gameInstance.GetLatestFrame(),
+	}
+
+	if !success {
+		resp.Message = "operation rejected: invalid snapshot or sequence"
+		if rollbackSnap != nil {
+			resp.NeedsRollback = true
+			resp.RollbackSnapshot = rollbackSnap
+		}
+	} else {
+		resp.Message = "card played successfully"
+	}
+
+	return resp, nil
 }
 
 func (s *GameServer) Attack(ctx context.Context, req *pb.AttackRequest) (*pb.AttackResponse, error) {
@@ -79,18 +105,36 @@ func (s *GameServer) Attack(ctx context.Context, req *pb.AttackRequest) (*pb.Att
 		return nil, status.Errorf(codes.NotFound, "game not found")
 	}
 
-	success := gameInstance.Attack(req.PlayerId, ecs.EntityID(req.AttackerEntityId), ecs.EntityID(req.TargetEntityId))
-	if !success {
-		return &pb.AttackResponse{
-			Success: false,
-			Message: "failed to attack",
-		}, nil
+	seq := req.Sequence
+	if seq == 0 {
+		seq = gameInstance.GetPlayerNextSeq(req.PlayerId)
 	}
 
-	return &pb.AttackResponse{
-		Success: true,
-		Message: "attack successful",
-	}, nil
+	success, rollbackSnap := gameInstance.Attack(
+		req.PlayerId,
+		ecs.EntityID(req.AttackerEntityId),
+		ecs.EntityID(req.TargetEntityId),
+		req.BaseSnapshotFrame,
+		req.BaseSnapshotHash,
+		seq,
+	)
+
+	resp := &pb.AttackResponse{
+		Success:        success,
+		ConfirmedFrame: gameInstance.GetLatestFrame(),
+	}
+
+	if !success {
+		resp.Message = "operation rejected: invalid snapshot or sequence"
+		if rollbackSnap != nil {
+			resp.NeedsRollback = true
+			resp.RollbackSnapshot = rollbackSnap
+		}
+	} else {
+		resp.Message = "attack successful"
+	}
+
+	return resp, nil
 }
 
 func (s *GameServer) EndTurn(ctx context.Context, req *pb.EndTurnRequest) (*pb.EndTurnResponse, error) {
@@ -99,18 +143,34 @@ func (s *GameServer) EndTurn(ctx context.Context, req *pb.EndTurnRequest) (*pb.E
 		return nil, status.Errorf(codes.NotFound, "game not found")
 	}
 
-	success := gameInstance.EndTurn(req.PlayerId)
-	if !success {
-		return &pb.EndTurnResponse{
-			Success: false,
-			Message: "failed to end turn",
-		}, nil
+	seq := req.Sequence
+	if seq == 0 {
+		seq = gameInstance.GetPlayerNextSeq(req.PlayerId)
 	}
 
-	return &pb.EndTurnResponse{
-		Success: true,
-		Message: "turn ended successfully",
-	}, nil
+	success, rollbackSnap := gameInstance.EndTurn(
+		req.PlayerId,
+		req.BaseSnapshotFrame,
+		req.BaseSnapshotHash,
+		seq,
+	)
+
+	resp := &pb.EndTurnResponse{
+		Success:        success,
+		ConfirmedFrame: gameInstance.GetLatestFrame(),
+	}
+
+	if !success {
+		resp.Message = "operation rejected"
+		if rollbackSnap != nil {
+			resp.NeedsRollback = true
+			resp.RollbackSnapshot = rollbackSnap
+		}
+	} else {
+		resp.Message = "turn ended"
+	}
+
+	return resp, nil
 }
 
 func (s *GameServer) Concede(ctx context.Context, req *pb.ConcedeRequest) (*pb.ConcedeResponse, error) {
@@ -119,7 +179,12 @@ func (s *GameServer) Concede(ctx context.Context, req *pb.ConcedeRequest) (*pb.C
 		return nil, status.Errorf(codes.NotFound, "game not found")
 	}
 
-	success := gameInstance.Concede(req.PlayerId)
+	seq := req.Sequence
+	if seq == 0 {
+		seq = gameInstance.GetPlayerNextSeq(req.PlayerId)
+	}
+
+	success := gameInstance.Concede(req.PlayerId, seq)
 	if !success {
 		return &pb.ConcedeResponse{
 			Success: false,
@@ -127,9 +192,11 @@ func (s *GameServer) Concede(ctx context.Context, req *pb.ConcedeRequest) (*pb.C
 		}, nil
 	}
 
+	s.gameManager.MarkGameEnded(req.GameId, gameInstance.GetWinner(), gameInstance.GetTurns(), gameInstance.DurationMs)
+
 	return &pb.ConcedeResponse{
 		Success: true,
-		Message: "conceded successfully",
+		Message: "conceded",
 	}, nil
 }
 
@@ -140,8 +207,41 @@ func (s *GameServer) GetGameState(ctx context.Context, req *pb.GetGameStateReque
 	}
 
 	return &pb.GetGameStateResponse{
-		State: gameInstance.GetGameState(req.PlayerId),
+		State:          gameInstance.GetGameState(req.PlayerId),
+		LatestSnapshot: gameInstance.GetCurrentSnapshot(),
 	}, nil
+}
+
+func (s *GameServer) GetSnapshot(ctx context.Context, req *pb.GetSnapshotRequest) (*pb.GetSnapshotResponse, error) {
+	gameInstance, ok := s.gameManager.GetGame(req.GameId)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "game not found")
+	}
+
+	if req.FrameNumber == 0 {
+		return &pb.GetSnapshotResponse{
+			Found:        true,
+			Snapshot:     gameInstance.GetCurrentSnapshot(),
+			LatestFrame:  gameInstance.GetLatestFrame(),
+		}, nil
+	}
+
+	snap, found := gameInstance.GetSnapshot(req.FrameNumber)
+	return &pb.GetSnapshotResponse{
+		Found:       found,
+		Snapshot:    snap,
+		LatestFrame: gameInstance.GetLatestFrame(),
+	}, nil
+}
+
+func (s *GameServer) SendAck(ctx context.Context, req *pb.SendAckRequest) (*pb.SendAckResponse, error) {
+	gameInstance, ok := s.gameManager.GetGame(req.GameId)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "game not found")
+	}
+
+	gameInstance.ReceiveAck(req.Ack)
+	return &pb.SendAckResponse{Success: true}, nil
 }
 
 func (s *GameServer) StreamGame(req *pb.StreamGameRequest, stream pb.GameService_StreamGameServer) error {
@@ -154,10 +254,11 @@ func (s *GameServer) StreamGame(req *pb.StreamGameRequest, stream pb.GameService
 	defer gameInstance.Unsubscribe(req.PlayerId)
 
 	ctx := stream.Context()
+
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
 				return nil
@@ -169,58 +270,81 @@ func (s *GameServer) StreamGame(req *pb.StreamGameRequest, stream pb.GameService
 	}
 }
 
-func (s *GameServer) SendAction(stream pb.GameService_SendActionServer) error {
-	go func() {
-		for {
-			action, err := stream.Recv()
-			if err != nil {
-				return
-			}
+func (s *GameServer) SendActionStream(stream pb.GameService_SendActionStreamServer) error {
+	ctx := stream.Context()
+	var currentGameID string
+	var currentPlayerID string
 
-			if action.Type == pb.ActionType_ACTION_TYPE_PLAY_CARD {
-				req := &pb.PlayCardRequest{
-					GameId:         action.PlayerId,
-					PlayerId:       action.PlayerId,
-					CardEntityId:   action.CardId,
-					TargetEntityId: action.TargetId,
-				}
-				s.PlayCard(context.Background(), req)
-			} else if action.Type == pb.ActionType_ACTION_TYPE_ATTACK {
-				req := &pb.AttackRequest{
-					GameId:           action.PlayerId,
-					PlayerId:         action.PlayerId,
-					AttackerEntityId: action.CardId,
-					TargetEntityId:   action.TargetId,
-				}
-				s.Attack(context.Background(), req)
-			} else if action.Type == pb.ActionType_ACTION_TYPE_END_TURN {
-				req := &pb.EndTurnRequest{
-					GameId:   action.PlayerId,
-					PlayerId: action.PlayerId,
-				}
-				s.EndTurn(context.Background(), req)
-			} else if action.Type == pb.ActionType_ACTION_TYPE_CONCEDE {
-				req := &pb.ConcedeRequest{
-					GameId:   action.PlayerId,
-					PlayerId: action.PlayerId,
-				}
-				s.Concede(context.Background(), req)
-			}
-		}
-	}()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	for {
 		select {
-		case <-stream.Context().Done():
-			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 		}
+
+		action, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		currentPlayerID = action.PlayerId
+		if currentGameID == "" {
+			continue
+		}
+
+		gameInstance, ok := s.gameManager.GetGame(currentGameID)
+		if !ok {
+			continue
+		}
+
+		var respFrame *pb.GameFrame
+		switch action.Type {
+		case pb.ActionType_ACTION_TYPE_PLAY_CARD:
+			_, _ = gameInstance.PlayCard(
+				action.PlayerId,
+				ecs.EntityID(action.CardId),
+				ecs.EntityID(action.TargetId),
+				action.BaseSnapshotFrame,
+				action.BaseSnapshotHash,
+				action.Sequence,
+			)
+		case pb.ActionType_ACTION_TYPE_ATTACK:
+			_, _ = gameInstance.Attack(
+				action.PlayerId,
+				ecs.EntityID(action.CardId),
+				ecs.EntityID(action.TargetId),
+				action.BaseSnapshotFrame,
+				action.BaseSnapshotHash,
+				action.Sequence,
+			)
+		case pb.ActionType_ACTION_TYPE_END_TURN:
+			_, _ = gameInstance.EndTurn(
+				action.PlayerId,
+				action.BaseSnapshotFrame,
+				action.BaseSnapshotHash,
+				action.Sequence,
+			)
+		case pb.ActionType_ACTION_TYPE_CONCEDE:
+			_ = gameInstance.Concede(action.PlayerId, action.Sequence)
+		}
+
+		_ = respFrame
+
+		ack := &pb.FrameAck{
+			PlayerId:     action.PlayerId,
+			FrameNumber:  gameInstance.GetLatestFrame(),
+			ExpectedHash: 0,
+			Timestamp:    time.Now().UnixNano() / int64(time.Millisecond),
+		}
+		gameInstance.ReceiveAck(ack)
 	}
 }
 
 func (s *GameServer) Close() {
-	s.gameManager.Close()
+	if s.gameManager != nil {
+		s.gameManager.Close()
+	}
 }

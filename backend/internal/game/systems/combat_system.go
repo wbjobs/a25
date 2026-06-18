@@ -49,7 +49,7 @@ func (s *CombatSystem) PlayCard(world *ecs.World, playerEntity *ecs.Entity, card
 
 	handComp.Cards = s.removeCardFromHand(handComp.Cards, cardID)
 
-	switch cardComp.Type {
+	switch cardComp.CardType {
 	case components.CardTypeMinion:
 		return s.playMinion(world, playerEntity, cardEntity)
 	case components.CardTypeSpell:

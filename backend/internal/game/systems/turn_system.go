@@ -78,6 +78,7 @@ func (s *TurnSystem) createPlayer(world *ecs.World, playerID, playerName string,
 		MaxMana:     0,
 	})
 	player.AddComponent(&components.OwnerComponent{PlayerID: playerID})
+	player.AddComponent(&components.FatigueComponent{Counter: 0})
 
 	world.AddEntity(player)
 	return player

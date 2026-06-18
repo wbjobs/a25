@@ -3,8 +3,8 @@ package systems
 import (
 	"testing"
 
-	"cardgame/internal/ecs"
-	"cardgame/internal/game/components"
+	"github.com/ecscard/game/internal/ecs"
+	"github.com/ecscard/game/internal/game/components"
 	"github.com/stretchr/testify/assert"
 )
 

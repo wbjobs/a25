@@ -17,6 +17,7 @@ enum SpellEffect {
   SPELL_EFFECT_DRAW = 2;
   SPELL_EFFECT_HEAL = 3;
   SPELL_EFFECT_BUFF = 4;
+  SPELL_EFFECT_FREEZE = 5;
 }
 
 enum GameState {
@@ -39,6 +40,14 @@ enum ActionType {
   ACTION_TYPE_ATTACK = 2;
   ACTION_TYPE_END_TURN = 3;
   ACTION_TYPE_CONCEDE = 4;
+  ACTION_TYPE_NOOP = 5;
+}
+
+enum RollbackReason {
+  ROLLBACK_REASON_UNSPECIFIED = 0;
+  ROLLBACK_REASON_DESYNC = 1;
+  ROLLBACK_REASON_INVALID_OP = 2;
+  ROLLBACK_REASON_TIMEOUT = 3;
 }
 
 message Card {
@@ -61,6 +70,7 @@ message Card {
   bool charge = 17;
   bool divine_shield = 18;
   bool frozen = 19;
+  int32 board_position = 20;
 }
 
 message Player {
@@ -76,6 +86,8 @@ message Player {
   repeated uint64 board = 10;
   int32 deck_size = 11;
   uint64 weapon = 12;
+  uint64 last_ack_frame = 13;
+  int32 fatigue_counter = 14;
 }
 
 message GameStatus {
@@ -88,16 +100,21 @@ message GameStatus {
   string winner = 7;
   repeated Player players = 8;
   repeated Card cards = 9;
+  uint64 snapshot_frame = 10;
+  fixed64 snapshot_hash = 11;
+  int64 timestamp = 12;
 }
 
 message Action {
   uint64 sequence = 1;
   ActionType type = 2;
   string player_id = 3;
-  uint64 frame_number = 4;
-  uint64 card_id = 5;
-  uint64 target_id = 6;
-  int64 timestamp = 7;
+  uint64 base_snapshot_frame = 4;
+  fixed64 base_snapshot_hash = 5;
+  uint64 card_id = 6;
+  uint64 target_id = 7;
+  int64 timestamp = 8;
+  uint64 client_frame = 9;
 }
 
 message GameEvent {
@@ -109,11 +126,39 @@ message GameEvent {
   int64 timestamp = 6;
 }
 
+message GameSnapshot {
+  uint64 frame_number = 1;
+  fixed64 hash = 2;
+  GameStatus status = 3;
+  repeated Action pending_actions = 4;
+  int64 created_at = 5;
+  uint32 checksum = 6;
+}
+
+message FrameAck {
+  string player_id = 1;
+  uint64 frame_number = 2;
+  fixed64 expected_hash = 3;
+  int64 timestamp = 4;
+}
+
+message RollbackCommand {
+  uint64 rollback_to_frame = 1;
+  fixed64 rollback_hash = 2;
+  GameSnapshot snapshot = 3;
+  RollbackReason reason = 4;
+  string message = 5;
+}
+
 message GameFrame {
   uint64 frame_number = 1;
-  repeated Action actions = 2;
+  repeated Action confirmed_actions = 2;
   repeated GameEvent events = 3;
   GameStatus status = 4;
+  uint64 snapshot_interval = 5;
+  GameSnapshot latest_snapshot = 6;
+  RollbackCommand rollback = 7;
+  repeated FrameAck pending_acks = 8;
 }
 
 message StartGameRequest {
@@ -122,11 +167,16 @@ message StartGameRequest {
   string player2_id = 3;
   string player2_name = 4;
   string game_type = 5;
+  bool is_ai_opponent = 6;
+  string ai_difficulty = 7;
 }
 
 message StartGameResponse {
   string game_id = 1;
   GameStatus initial_state = 2;
+  GameSnapshot initial_snapshot = 3;
+  uint64 snapshot_interval_ms = 4;
+  string player_assigned_id = 5;
 }
 
 message PlayCardRequest {
@@ -134,11 +184,17 @@ message PlayCardRequest {
   string player_id = 2;
   uint64 card_entity_id = 3;
   uint64 target_entity_id = 4;
+  uint64 base_snapshot_frame = 5;
+  fixed64 base_snapshot_hash = 6;
+  uint64 sequence = 7;
 }
 
 message PlayCardResponse {
   bool success = 1;
   string message = 2;
+  uint64 confirmed_frame = 3;
+  bool needs_rollback = 4;
+  GameSnapshot rollback_snapshot = 5;
 }
 
 message AttackRequest {
@@ -146,26 +202,39 @@ message AttackRequest {
   string player_id = 2;
   uint64 attacker_entity_id = 3;
   uint64 target_entity_id = 4;
+  uint64 base_snapshot_frame = 5;
+  fixed64 base_snapshot_hash = 6;
+  uint64 sequence = 7;
 }
 
 message AttackResponse {
   bool success = 1;
   string message = 2;
+  uint64 confirmed_frame = 3;
+  bool needs_rollback = 4;
+  GameSnapshot rollback_snapshot = 5;
 }
 
 message EndTurnRequest {
   string game_id = 1;
   string player_id = 2;
+  uint64 base_snapshot_frame = 3;
+  fixed64 base_snapshot_hash = 4;
+  uint64 sequence = 5;
 }
 
 message EndTurnResponse {
   bool success = 1;
   string message = 2;
+  uint64 confirmed_frame = 3;
+  bool needs_rollback = 4;
+  GameSnapshot rollback_snapshot = 5;
 }
 
 message ConcedeRequest {
   string game_id = 1;
   string player_id = 2;
+  uint64 sequence = 3;
 }
 
 message ConcedeResponse {
@@ -180,11 +249,34 @@ message GetGameStateRequest {
 
 message GetGameStateResponse {
   GameStatus state = 1;
+  GameSnapshot latest_snapshot = 2;
+}
+
+message GetSnapshotRequest {
+  string game_id = 1;
+  string player_id = 2;
+  uint64 frame_number = 3;
+}
+
+message GetSnapshotResponse {
+  bool found = 1;
+  GameSnapshot snapshot = 2;
+  uint64 latest_frame = 3;
+}
+
+message SendAckRequest {
+  string game_id = 1;
+  FrameAck ack = 2;
+}
+
+message SendAckResponse {
+  bool success = 1;
 }
 
 message StreamGameRequest {
   string game_id = 1;
   string player_id = 2;
+  uint64 start_from_frame = 3;
 }
 
 service GameService {
@@ -194,6 +286,8 @@ service GameService {
   rpc EndTurn(EndTurnRequest) returns (EndTurnResponse);
   rpc Concede(ConcedeRequest) returns (ConcedeResponse);
   rpc GetGameState(GetGameStateRequest) returns (GetGameStateResponse);
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc SendAck(SendAckRequest) returns (SendAckResponse);
   rpc StreamGame(StreamGameRequest) returns (stream GameFrame);
-  rpc SendAction(stream Action) returns (stream GameFrame);
+  rpc SendActionStream(stream Action) returns (stream GameFrame);
 }

@@ -4,9 +4,23 @@ server:
   tick_rate: 30
 
 redis:
-  address: "redis:6379"
-  password: ""
+  addr: "localhost:6379"
+  password: "redis123"
   db: 0
+  use_cluster: false
+  cluster_addrs:
+    - "localhost:7001"
+    - "localhost:7002"
+    - "localhost:7003"
+    - "localhost:7004"
+    - "localhost:7005"
+    - "localhost:7006"
+
+cache:
+  local_max_cost: 1073741824
+  local_num_counters: 10000000
+  snapshot_ttl_seconds: 300
+  game_state_ttl_seconds: 3600
 
 mongodb:
   uri: "mongodb://mongodb:27017"
@@ -27,6 +41,16 @@ matchmaking:
   max_wait_time_seconds: 120
   initial_rating_diff: 50
   max_rating_diff: 300
+
+ai:
+  enabled: false
+  model_path: "./models/ppo_model.onnx"
+  default_difficulty: "normal"
+
+lockstep:
+  snapshot_interval_ms: 100
+  max_snapshot_history: 128
+  desync_threshold: 3
 
 logging:
   level: "debug"

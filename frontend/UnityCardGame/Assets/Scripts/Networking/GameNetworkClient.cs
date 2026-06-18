@@ -18,6 +18,16 @@ namespace CardGame.Networking
         private string _gameId;
         private string _matchId;
 
+        private ulong _latestSnapshotFrame;
+        private ulong _latestSnapshotHash;
+        private uint _sequenceCounter;
+        private Queue<Action> _pendingActions = new Queue<Action>();
+        private bool _needsRollback;
+        private GameSnapshot _rollbackSnapshot;
+        private float _snapshotIntervalMs = 200f;
+        private int _frameCountSinceLastAck;
+        private ulong _confirmedFrame;
+
         public event Action<GameStatus> OnGameStateUpdate;
         public event Action<GameFrame> OnGameFrame;
         public event Action<MatchResponse> OnMatchUpdate;
@@ -114,6 +124,8 @@ namespace CardGame.Networking
 
         public async Task StartGameStream()
         {
+            StartCoroutine(AutoAckCoroutine());
+
             var request = new StreamGameRequest
             {
                 GameId = _gameId,
@@ -137,6 +149,29 @@ namespace CardGame.Networking
 
         private void HandleGameFrame(GameFrame frame)
         {
+            if (frame.LatestSnapshot != null)
+            {
+                _latestSnapshotFrame = frame.LatestSnapshot.Frame;
+                _latestSnapshotHash = frame.LatestSnapshot.Hash;
+            }
+
+            if (frame.Rollback != null)
+            {
+                HandleRollback(frame.Rollback);
+            }
+
+            if (frame.ConfirmedFrame > _confirmedFrame)
+            {
+                _confirmedFrame = frame.ConfirmedFrame;
+            }
+
+            _frameCountSinceLastAck++;
+            if (_frameCountSinceLastAck >= 3)
+            {
+                SendAck();
+                _frameCountSinceLastAck = 0;
+            }
+
             OnGameFrame?.Invoke(frame);
             if (frame.Status != null)
             {
@@ -144,38 +179,151 @@ namespace CardGame.Networking
             }
         }
 
+        public void GetLatestSnapshotInfo(out ulong frame, out ulong hash)
+        {
+            frame = _latestSnapshotFrame;
+            hash = _latestSnapshotHash;
+        }
+
+        public uint IncrementSequence()
+        {
+            return ++_sequenceCounter;
+        }
+
+        private void ApplySnapshot(GameSnapshot snapshot)
+        {
+            if (snapshot == null) return;
+
+            GameStateManager.Instance.ApplyState(snapshot.State);
+            _latestSnapshotFrame = snapshot.Frame;
+            _latestSnapshotHash = snapshot.Hash;
+        }
+
+        private void HandleRollback(RollbackCommand rollback)
+        {
+            if (rollback == null) return;
+
+            ApplySnapshot(rollback.Snapshot);
+            _pendingActions.Clear();
+            _needsRollback = false;
+            _rollbackSnapshot = null;
+
+            Debug.Log($"Rollback to frame {rollback.Snapshot.Frame}");
+        }
+
+        private void SendAck()
+        {
+            if (!IsInGame || _gameClient == null) return;
+
+            var ack = new FrameAck
+            {
+                GameId = _gameId,
+                PlayerId = _playerId,
+                ConfirmedFrame = _confirmedFrame
+            };
+
+            _ = _gameClient.SendFrameAckAsync(ack);
+        }
+
+        private System.Collections.IEnumerator AutoAckCoroutine()
+        {
+            var wait = new WaitForSecondsRealtime(_snapshotIntervalMs / 1000f);
+            while (IsInGame)
+            {
+                yield return wait;
+                if (IsInGame)
+                {
+                    SendAck();
+                }
+            }
+        }
+
         public async Task<PlayCardResponse> PlayCard(ulong cardEntityId, ulong targetEntityId = 0)
         {
+            GetLatestSnapshotInfo(out ulong snapshotFrame, out ulong snapshotHash);
+
             var request = new PlayCardRequest
             {
                 GameId = _gameId,
                 PlayerId = _playerId,
                 CardEntityId = cardEntityId,
-                TargetEntityId = targetEntityId
+                TargetEntityId = targetEntityId,
+                BaseSnapshotFrame = snapshotFrame,
+                BaseSnapshotHash = snapshotHash,
+                Sequence = IncrementSequence()
             };
-            return await _gameClient.PlayCardAsync(request);
+
+            var response = await _gameClient.PlayCardAsync(request);
+
+            if (response.NeedsRollback && response.Rollback != null)
+            {
+                HandleRollback(response.Rollback);
+            }
+
+            if (response.ConfirmedFrame > _confirmedFrame)
+            {
+                _confirmedFrame = response.ConfirmedFrame;
+            }
+
+            return response;
         }
 
         public async Task<AttackResponse> Attack(ulong attackerEntityId, ulong targetEntityId)
         {
+            GetLatestSnapshotInfo(out ulong snapshotFrame, out ulong snapshotHash);
+
             var request = new AttackRequest
             {
                 GameId = _gameId,
                 PlayerId = _playerId,
                 AttackerEntityId = attackerEntityId,
-                TargetEntityId = targetEntityId
+                TargetEntityId = targetEntityId,
+                BaseSnapshotFrame = snapshotFrame,
+                BaseSnapshotHash = snapshotHash,
+                Sequence = IncrementSequence()
             };
-            return await _gameClient.AttackAsync(request);
+
+            var response = await _gameClient.AttackAsync(request);
+
+            if (response.NeedsRollback && response.Rollback != null)
+            {
+                HandleRollback(response.Rollback);
+            }
+
+            if (response.ConfirmedFrame > _confirmedFrame)
+            {
+                _confirmedFrame = response.ConfirmedFrame;
+            }
+
+            return response;
         }
 
         public async Task<EndTurnResponse> EndTurn()
         {
+            GetLatestSnapshotInfo(out ulong snapshotFrame, out ulong snapshotHash);
+
             var request = new EndTurnRequest
             {
                 GameId = _gameId,
-                PlayerId = _playerId
+                PlayerId = _playerId,
+                BaseSnapshotFrame = snapshotFrame,
+                BaseSnapshotHash = snapshotHash,
+                Sequence = IncrementSequence()
             };
-            return await _gameClient.EndTurnAsync(request);
+
+            var response = await _gameClient.EndTurnAsync(request);
+
+            if (response.NeedsRollback && response.Rollback != null)
+            {
+                HandleRollback(response.Rollback);
+            }
+
+            if (response.ConfirmedFrame > _confirmedFrame)
+            {
+                _confirmedFrame = response.ConfirmedFrame;
+            }
+
+            return response;
         }
 
         public async Task<ConcedeResponse> Concede()

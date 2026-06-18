@@ -25,6 +25,8 @@ message Player {
 message MatchRequest {
   Player player = 1;
   string game_type = 2;
+  bool is_ai_opponent = 3;
+  string ai_difficulty = 4;
 }
 
 message MatchResponse {

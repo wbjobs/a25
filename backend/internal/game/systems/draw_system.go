@@ -87,14 +87,23 @@ func (s *DrawSystem) dealFatigue(world *ecs.World, playerEntity *ecs.Entity) {
 		return
 	}
 
-	heroComp.Health--
+	fatigueComp, _ := playerEntity.GetComponent("fatigue").(*components.FatigueComponent)
+	if fatigueComp == nil {
+		fatigueComp = &components.FatigueComponent{Counter: 0}
+		playerEntity.AddComponent(fatigueComp)
+	}
+
+	fatigueComp.Counter++
+	damage := fatigueComp.Counter
+
+	heroComp.Health -= damage
 	if heroComp.Health < 0 {
 		heroComp.Health = 0
 	}
 
 	world.EmitEvent("fatigue_damage", map[string]interface{}{
 		"player_id": s.getPlayerID(playerEntity),
-		"damage":    1,
+		"damage":    damage,
 	}, playerEntity)
 }
 

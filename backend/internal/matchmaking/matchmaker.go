@@ -7,15 +7,18 @@ import (
 
 	"github.com/ecscard/game/internal/mongodb"
 	"github.com/ecscard/game/internal/redis"
-	pb "github.com/ecscard/game/proto/v1"
+
 	"github.com/google/uuid"
+	pb "github.com/ecscard/game/internal/proto"
 )
 
 type QueuedPlayer struct {
-	Player   *pb.Player
-	GameType string
-	Channel  chan *pb.MatchResponse
-	JoinedAt time.Time
+	Player        *pb.Player
+	GameType      string
+	Channel       chan *pb.MatchResponse
+	JoinedAt      time.Time
+	IsAIOpponent  bool
+	AIDifficulty  string
 }
 
 type MatchResult struct {
@@ -58,7 +61,7 @@ func NewMatchmaker(redisAddr, mongoURI, gameServerAddr string, gameClient pb.Gam
 	return m, nil
 }
 
-func (m *Matchmaker) FindMatch(player *pb.Player, gameType string) (chan *pb.MatchResponse, error) {
+func (m *Matchmaker) FindMatch(player *pb.Player, gameType string, isAIOpponent bool, aiDifficulty string) (chan *pb.MatchResponse, error) {
 	if gameType == "" {
 		gameType = "normal"
 	}
@@ -80,10 +83,12 @@ func (m *Matchmaker) FindMatch(player *pb.Player, gameType string) (chan *pb.Mat
 
 	m.mu.Lock()
 	m.queue[gameType] = append(m.queue[gameType], &QueuedPlayer{
-		Player:   player,
-		GameType: gameType,
-		Channel:  ch,
-		JoinedAt: time.Now(),
+		Player:       player,
+		GameType:     gameType,
+		Channel:      ch,
+		JoinedAt:     time.Now(),
+		IsAIOpponent: isAIOpponent,
+		AIDifficulty: aiDifficulty,
 	})
 	m.mu.Unlock()
 
@@ -125,11 +130,60 @@ func (m *Matchmaker) tryMatch() {
 	defer m.mu.Unlock()
 
 	for gameType, players := range m.queue {
-		if len(players) < 2 {
+		var aiCandidates := make([]*QueuedPlayer, 0)
+		for _, p := range players {
+			if p.IsAIOpponent {
+				aiCandidates = append(aiCandidates, p)
+				continue
+			}
+			if time.Since(p.JoinedAt).Seconds() >= 30 {
+				aiCandidates = append(aiCandidates, p)
+			}
+		}
+
+		for _, p := range aiCandidates {
+			aiPlayer := &QueuedPlayer{
+				Player: &pb.Player{
+					PlayerId:   "ai_" + uuid.New().String(),
+					PlayerName: "AI Opponent",
+				},
+				IsAIOpponent: true,
+				AIDifficulty: p.AIDifficulty,
+			}
+
+			m.removeFromQueue(gameType, p.Player.PlayerId)
+
+			matchID := uuid.New().String()
+
+			resp1 := &pb.MatchResponse{
+				MatchId: matchID,
+				Status:  pb.MatchStatus_MATCH_STATUS_MATCHED,
+				Opponent: &pb.Player{
+					PlayerId:   aiPlayer.Player.PlayerId,
+					PlayerName: aiPlayer.Player.PlayerName,
+				},
+			}
+
+			resp2 := &pb.MatchResponse{
+				MatchId: matchID,
+				Status:  pb.MatchStatus_MATCH_STATUS_MATCHED,
+				Opponent: &pb.Player{
+					PlayerId:   p.Player.PlayerId,
+					PlayerName: p.Player.PlayerName,
+				},
+			}
+
+			p.Channel <- resp1
+			aiPlayer.Channel = make(chan *pb.MatchResponse, 10)
+
+			go m.startGame(matchID, p, aiPlayer, gameType)
+		}
+
+		if len(m.queue[gameType]) < 2 {
 			continue
 		}
 
-		matched := m.findMatchingPair(players)
+		matched := m.findMatchingPair(m.queue[gameType])
 		if matched == nil {
 			continue
 		}
@@ -209,11 +263,16 @@ func (m *Matchmaker) startGame(matchID string, p1, p2 *QueuedPlayer, gameType st
 	ctx := context.Background()
 
 	startReq := &pb.StartGameRequest{
-		Player1Id:   p1.Player.PlayerId,
-		Player1Name: p1.Player.PlayerName,
-		Player2Id:   p2.Player.PlayerId,
-		Player2Name: p2.Player.PlayerName,
-		GameType:    gameType,
+		Player1Id:    p1.Player.PlayerId,
+		Player1Name:  p1.Player.PlayerName,
+		Player2Id:    p2.Player.PlayerId,
+		Player2Name:  p2.Player.PlayerName,
+		GameType:     gameType,
+		IsAiOpponent: p1.IsAIOpponent || p2.IsAIOpponent,
+		AiDifficulty: p1.AIDifficulty,
+	}
+	if p2.IsAIOpponent {
+		startReq.AiDifficulty = p2.AIDifficulty
 	}
 
 	startResp, err := m.gameClient.StartGame(ctx, startReq)

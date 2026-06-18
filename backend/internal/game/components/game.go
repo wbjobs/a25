@@ -101,3 +101,10 @@ type DyingComponent struct {
 }
 
 func (DyingComponent) Type() string { return "dying" }
+
+type FatigueComponent struct {
+	ecs.BaseComponent
+	Counter int
+}
+
+func (FatigueComponent) Type() string { return "fatigue" }

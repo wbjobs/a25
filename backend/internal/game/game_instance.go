@@ -3,14 +3,30 @@ package game
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/ecscard/game/internal/ai"
 	"github.com/ecscard/game/internal/ecs"
 	"github.com/ecscard/game/internal/game/components"
 	"github.com/ecscard/game/internal/game/systems"
-	pb "github.com/ecscard/game/proto/v1"
+	"github.com/ecscard/game/internal/lockstep"
+	pb "github.com/ecscard/game/internal/proto"
 )
+
+const (
+	TickIntervalMs     = 30
+	SnapshotIntervalMs = 100
+	GameFrameDuration  = SnapshotIntervalMs
+)
+
+type ActionWithValid struct {
+	Action      *pb.Action
+	Validated   bool
+	Applied     bool
+	Rollback    bool
+}
 
 type GameInstance struct {
 	GameID       string
@@ -22,17 +38,34 @@ type GameInstance struct {
 	TurnSystem   *systems.TurnSystem
 	Player1ID    string
 	Player2ID    string
+	Player1Name  string
+	Player2Name  string
 	CreatedAt    time.Time
 	StartedAt    time.Time
 	EndedAt      time.Time
 	DurationMs   int64
-	mu           sync.RWMutex
+	IsAIGame     bool
+	AIDifficulty string
+	aiAgent      *ai.PPOAgent
+	aiPlayerID   string
+	aiThinking   bool
+
+	mu sync.RWMutex
+
 	streams      map[string]chan *pb.GameFrame
-	actionSeq    uint64
 	eventSeq     uint64
+
+	lockstep *lockstep.LockstepEngine
+
+	confirmedActions map[uint64][]ActionWithValid
+	rollbackInProgress bool
+	lastSnapshotFrame  uint64
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name string) *GameInstance {
+func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name string, isAI bool, aiDifficulty string) *GameInstance {
 	world := ecs.NewWorld()
 
 	cardSystem := systems.NewCardSystem()
@@ -45,6 +78,8 @@ func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2
 	world.AddSystem(combatSystem)
 	world.AddSystem(turnSystem)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	gi := &GameInstance{
 		GameID:       gameID,
 		MatchID:      matchID,
@@ -55,40 +90,272 @@ func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2
 		TurnSystem:   turnSystem,
 		Player1ID:    player1ID,
 		Player2ID:    player2ID,
+		Player1Name:  player1Name,
+		Player2Name:  player2Name,
 		CreatedAt:    time.Now(),
+		IsAIGame:     isAI,
+		AIDifficulty: aiDifficulty,
 		streams:      make(map[string]chan *pb.GameFrame),
+		confirmedActions: make(map[uint64][]ActionWithValid),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+
+	gi.lockstep = lockstep.NewLockstepEngine(gameID, world)
+	gi.lockstep.RegisterPlayer(player1ID)
+	gi.lockstep.RegisterPlayer(player2ID)
+
+	gi.lockstep.SetCallbacks(
+		gi.handleRollback,
+		gi.handleSnapshotCreated,
+		gi.handleDesync,
+	)
+
+	if isAI {
+		var difficulty ai.AIDifficulty
+		switch aiDifficulty {
+		case "easy":
+			difficulty = ai.AIDifficultyEasy
+		case "normal":
+			difficulty = ai.AIDifficultyNormal
+		case "hard":
+			difficulty = ai.AIDifficultyHard
+		default:
+			difficulty = ai.AIDifficultyNormal
+		}
+		agent, _ := ai.NewPPOAgent("", difficulty)
+		gi.aiAgent = agent
+		gi.aiPlayerID = player2ID
+		go gi.aiTurnLoop()
 	}
 
 	turnSystem.StartGame(world, player1ID, player2ID, player1Name, player2Name)
 	gi.StartedAt = time.Now()
 
+	initialStatus := gi.buildInternalStatus()
+	_ = gi.lockstep.GenerateSnapshot(initialStatus)
+	gi.lastSnapshotFrame = 1
+
 	go gi.startGameLoop()
+	go gi.snapshotLoop()
 	go gi.listenEvents()
 
 	return gi
 }
 
 func (g *GameInstance) startGameLoop() {
-	ticker := time.NewTicker(33 * time.Millisecond)
+	ticker := time.NewTicker(time.Duration(TickIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-g.World.Context().Done():
+		case <-g.ctx.Done():
 			return
 		case <-ticker.C:
-			g.mu.Lock()
-			state := g.TurnSystem.GetGameState(g.World)
-			if state != nil && state.State == components.GameStateFinished {
-				g.EndedAt = time.Now()
-				g.DurationMs = g.EndedAt.Sub(g.StartedAt).Milliseconds()
-				g.mu.Unlock()
-				return
-			}
-			g.World.Update(0.033)
-			g.mu.Unlock()
+			g.processTick()
 		}
 	}
+}
+
+func (g *GameInstance) snapshotLoop() {
+	ticker := time.NewTicker(time.Duration(SnapshotIntervalMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-ticker.C:
+			g.takeSnapshot()
+		}
+	}
+}
+
+func (g *GameInstance) aiTurnLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-ticker.C:
+			if g.IsFinished() {
+				return
+			}
+
+			g.mu.RLock()
+			isAITurn := g.TurnSystem.IsPlayerTurn(g.World, g.aiPlayerID)
+			thinking := g.aiThinking
+			g.mu.RUnlock()
+
+			if isAITurn && !thinking {
+				g.aiChooseAction()
+
+				var minDelay, maxDelay int
+				switch g.AIDifficulty {
+				case "easy":
+					minDelay = 600
+					maxDelay = 1000
+				case "normal":
+					minDelay = 400
+					maxDelay = 800
+				case "hard":
+					minDelay = 200
+					maxDelay = 500
+				default:
+					minDelay = 400
+					maxDelay = 800
+				}
+				delay := minDelay + rand.Intn(maxDelay-minDelay)
+				time.Sleep(time.Duration(delay) * time.Millisecond)
+			}
+		}
+	}
+}
+
+func (g *GameInstance) aiChooseAction() {
+	g.mu.Lock()
+	g.aiThinking = true
+	g.mu.Unlock()
+
+	defer func() {
+		g.mu.Lock()
+		g.aiThinking = false
+		g.mu.Unlock()
+	}()
+
+	if g.aiAgent == nil {
+		return
+	}
+
+	status := g.buildInternalStatus()
+	if status == nil {
+		return
+	}
+
+	action := g.aiAgent.ChooseAction(g.aiPlayerID, status)
+	if action == nil || !action.Valid {
+		return
+	}
+
+	currentSnap := g.lockstep.GetCurrentSnapshot()
+	if currentSnap == nil {
+		return
+	}
+	baseFrame := currentSnap.FrameNumber
+	baseHash := currentSnap.Hash
+
+	var selfPlayer, oppPlayer *pb.Player
+	for _, p := range status.Players {
+		if p.PlayerId == g.aiPlayerID {
+			selfPlayer = p
+		} else {
+			oppPlayer = p
+		}
+	}
+
+	if selfPlayer == nil {
+		return
+	}
+
+	switch action.Type {
+	case ai.ActionPlayCard:
+		if action.CardIdx < 0 || action.CardIdx >= len(selfPlayer.Hand) {
+			return
+		}
+		cardID := ecs.EntityID(selfPlayer.Hand[action.CardIdx])
+
+		var targetID ecs.EntityID
+		if action.TargetIdx == -1 {
+			targetID = 0
+		} else {
+			targetIdx := action.TargetIdx
+			found := false
+			if oppPlayer != nil {
+				if targetIdx < len(oppPlayer.Board) {
+					targetID = ecs.EntityID(oppPlayer.Board[targetIdx])
+					found = true
+				}
+				targetIdx -= len(oppPlayer.Board)
+			}
+			if !found && targetIdx >= 0 && targetIdx < len(selfPlayer.Board) {
+				targetID = ecs.EntityID(selfPlayer.Board[targetIdx])
+			}
+		}
+
+		g.PlayCard(g.aiPlayerID, cardID, targetID, baseFrame, baseHash, 0)
+
+	case ai.ActionAttack:
+		var attackerID ecs.EntityID
+		if action.CardIdx == ai.MaxBoardMinions {
+			if selfPlayer.Weapon != 0 {
+				attackerID = ecs.EntityID(selfPlayer.Weapon)
+			} else {
+				return
+			}
+		} else if action.CardIdx >= 0 && action.CardIdx < len(selfPlayer.Board) {
+			attackerID = ecs.EntityID(selfPlayer.Board[action.CardIdx])
+		} else {
+			return
+		}
+
+		var targetID ecs.EntityID
+		if action.TargetIdx == -1 {
+			targetID = 0
+		} else if oppPlayer != nil && action.TargetIdx >= 0 && action.TargetIdx < len(oppPlayer.Board) {
+			targetID = ecs.EntityID(oppPlayer.Board[action.TargetIdx])
+		} else {
+			return
+		}
+
+		g.Attack(g.aiPlayerID, attackerID, targetID, baseFrame, baseHash, 0)
+
+	case ai.ActionEndTurn:
+		g.EndTurn(g.aiPlayerID, baseFrame, baseHash, 0)
+	}
+}
+
+func (g *GameInstance) processTick() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	state := g.TurnSystem.GetGameState(g.World)
+	if state != nil && state.State == components.GameStateFinished {
+		if g.EndedAt.IsZero() {
+			g.EndedAt = time.Now()
+			g.DurationMs = g.EndedAt.Sub(g.StartedAt).Milliseconds()
+		}
+		return
+	}
+
+	g.World.Update(float64(TickIntervalMs) / 1000.0)
+}
+
+func (g *GameInstance) takeSnapshot() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	state := g.TurnSystem.GetGameState(g.World)
+	if state != nil && state.State == components.GameStateFinished {
+		return
+	}
+
+	status := g.buildInternalStatus()
+	snap := g.lockstep.GenerateSnapshot(status)
+	g.lastSnapshotFrame = snap.FrameNumber
+
+	g.confirmedActions[snap.FrameNumber] = make([]ActionWithValid, 0)
+
+	protoSnap := g.lockstep.ConvertToProtoSnapshot(snap)
+	frame := &pb.GameFrame{
+		FrameNumber:      snap.FrameNumber,
+		Status:           snap.Status,
+		SnapshotInterval: SnapshotIntervalMs,
+		LatestSnapshot:   protoSnap,
+	}
+
+	g.broadcastFrame(frame)
 }
 
 func (g *GameInstance) listenEvents() {
@@ -101,39 +368,47 @@ func (g *GameInstance) broadcastEvent(event *ecs.Event) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	currentSnap := g.lockstep.GetCurrentSnapshot()
+	frameNum := uint64(0)
+	if currentSnap != nil {
+		frameNum = currentSnap.FrameNumber
+	}
+
 	frame := &pb.GameFrame{
-		FrameNumber: g.getFrameNumber(),
+		FrameNumber:      frameNum,
+		SnapshotInterval: SnapshotIntervalMs,
 		Events: []*pb.GameEvent{
 			{
 				Sequence:    g.nextEventSeq(),
 				EventType:   event.Type,
-				FrameNumber: g.getFrameNumber(),
+				FrameNumber: frameNum,
 				Data:        g.eventDataToStringMap(event.Data),
 				EntityId:    uint64(event.Entity.ID),
-				Timestamp:   time.Now().UnixNano() / 1e6,
+				Timestamp:   time.Now().UnixNano() / int64(time.Millisecond),
 			},
 		},
 	}
 
+	if currentSnap != nil {
+		frame.LatestSnapshot = g.lockstep.ConvertToProtoSnapshot(currentSnap)
+	}
+
+	g.broadcastFrameNoLock(frame)
+}
+
+func (g *GameInstance) broadcastFrame(frame *pb.GameFrame) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	g.broadcastFrameNoLock(frame)
+}
+
+func (g *GameInstance) broadcastFrameNoLock(frame *pb.GameFrame) {
 	for _, ch := range g.streams {
 		select {
 		case ch <- frame:
 		default:
 		}
 	}
-}
-
-func (g *GameInstance) getFrameNumber() uint64 {
-	state := g.TurnSystem.GetGameState(g.World)
-	if state != nil {
-		return state.FrameNumber
-	}
-	return 0
-}
-
-func (g *GameInstance) nextActionSeq() uint64 {
-	g.actionSeq++
-	return g.actionSeq
 }
 
 func (g *GameInstance) nextEventSeq() uint64 {
@@ -151,51 +426,80 @@ func (g *GameInstance) eventDataToStringMap(data interface{}) map[string]string 
 	return result
 }
 
-func (g *GameInstance) PlayCard(playerID string, cardID, targetID ecs.EntityID) bool {
+func (g *GameInstance) validateAndApplyAction(action *pb.Action) (bool, *pb.GameSnapshot) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if !g.TurnSystem.IsPlayerTurn(g.World, playerID) {
+	if g.rollbackInProgress {
+		return false, g.lockstep.ConvertToProtoSnapshot(g.lockstep.GetCurrentSnapshot())
+	}
+
+	valid, rollbackSnap := g.lockstep.SubmitAction(action)
+	if !valid {
+		return false, g.lockstep.ConvertToProtoSnapshot(rollbackSnap)
+	}
+
+	var applied bool
+	switch action.Type {
+	case pb.ActionType_ACTION_TYPE_PLAY_CARD:
+		applied = g.applyPlayCard(action)
+	case pb.ActionType_ACTION_TYPE_ATTACK:
+		applied = g.applyAttack(action)
+	case pb.ActionType_ACTION_TYPE_END_TURN:
+		applied = g.applyEndTurn(action)
+	case pb.ActionType_ACTION_TYPE_CONCEDE:
+		applied = g.applyConcede(action)
+	}
+
+	currentSnap := g.lockstep.GetCurrentSnapshot()
+	act := ActionWithValid{
+		Action:    action,
+		Validated: valid,
+		Applied:   applied,
+	}
+	if currentSnap != nil {
+		if _, ok := g.confirmedActions[currentSnap.FrameNumber]; !ok {
+			g.confirmedActions[currentSnap.FrameNumber] = make([]ActionWithValid, 0)
+		}
+		g.confirmedActions[currentSnap.FrameNumber] = append(g.confirmedActions[currentSnap.FrameNumber], act)
+	}
+
+	return applied, nil
+}
+
+func (g *GameInstance) applyPlayCard(action *pb.Action) bool {
+	if !g.TurnSystem.IsPlayerTurn(g.World, action.PlayerId) {
 		return false
 	}
 
-	player := g.getPlayerEntity(playerID)
+	player := g.getPlayerEntity(action.PlayerId)
 	if player == nil {
 		return false
 	}
 
-	return g.CombatSystem.PlayCard(g.World, player, cardID, targetID)
+	return g.CombatSystem.PlayCard(g.World, player, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
 }
 
-func (g *GameInstance) Attack(playerID string, attackerID, targetID ecs.EntityID) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if !g.TurnSystem.IsPlayerTurn(g.World, playerID) {
+func (g *GameInstance) applyAttack(action *pb.Action) bool {
+	if !g.TurnSystem.IsPlayerTurn(g.World, action.PlayerId) {
 		return false
 	}
 
-	return g.CombatSystem.Attack(g.World, attackerID, targetID)
+	return g.CombatSystem.Attack(g.World, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
 }
 
-func (g *GameInstance) EndTurn(playerID string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return g.TurnSystem.EndTurn(g.World, playerID)
+func (g *GameInstance) applyEndTurn(action *pb.Action) bool {
+	return g.TurnSystem.EndTurn(g.World, action.PlayerId)
 }
 
-func (g *GameInstance) Concede(playerID string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
+func (g *GameInstance) applyConcede(action *pb.Action) bool {
 	state := g.TurnSystem.GetGameState(g.World)
 	if state == nil || state.State == components.GameStateFinished {
 		return false
 	}
 
 	opponentID := g.Player2ID
-	if playerID == g.Player2ID {
+	if action.PlayerId == g.Player2ID {
 		opponentID = g.Player1ID
 	}
 
@@ -213,18 +517,146 @@ func (g *GameInstance) Concede(playerID string) bool {
 	g.DurationMs = g.EndedAt.Sub(g.StartedAt).Milliseconds()
 
 	g.World.EmitEvent("player_conceded", map[string]interface{}{
-		"player_id": playerID,
+		"player_id": action.PlayerId,
 		"winner_id": opponentID,
 	}, nil)
 
 	return true
 }
 
-func (g *GameInstance) GetGameState(playerID string) *pb.GameStatus {
+func (g *GameInstance) PlayCard(playerID string, cardID, targetID ecs.EntityID, baseFrame uint64, baseHash uint64, seq uint64) (bool, *pb.GameSnapshot) {
+	action := &pb.Action{
+		Sequence:           seq,
+		Type:               pb.ActionType_ACTION_TYPE_PLAY_CARD,
+		PlayerId:           playerID,
+		BaseSnapshotFrame:  baseFrame,
+		BaseSnapshotHash:   baseHash,
+		CardId:             uint64(cardID),
+		TargetId:           uint64(targetID),
+		Timestamp:          time.Now().UnixNano() / int64(time.Millisecond),
+	}
+	return g.validateAndApplyAction(action)
+}
+
+func (g *GameInstance) Attack(playerID string, attackerID, targetID ecs.EntityID, baseFrame uint64, baseHash uint64, seq uint64) (bool, *pb.GameSnapshot) {
+	action := &pb.Action{
+		Sequence:           seq,
+		Type:               pb.ActionType_ACTION_TYPE_ATTACK,
+		PlayerId:           playerID,
+		BaseSnapshotFrame:  baseFrame,
+		BaseSnapshotHash:   baseHash,
+		CardId:             uint64(attackerID),
+		TargetId:           uint64(targetID),
+		Timestamp:          time.Now().UnixNano() / int64(time.Millisecond),
+	}
+	return g.validateAndApplyAction(action)
+}
+
+func (g *GameInstance) EndTurn(playerID string, baseFrame uint64, baseHash uint64, seq uint64) (bool, *pb.GameSnapshot) {
+	action := &pb.Action{
+		Sequence:           seq,
+		Type:               pb.ActionType_ACTION_TYPE_END_TURN,
+		PlayerId:           playerID,
+		BaseSnapshotFrame:  baseFrame,
+		BaseSnapshotHash:   baseHash,
+		Timestamp:          time.Now().UnixNano() / int64(time.Millisecond),
+	}
+	return g.validateAndApplyAction(action)
+}
+
+func (g *GameInstance) Concede(playerID string, seq uint64) bool {
+	action := &pb.Action{
+		Sequence:  seq,
+		Type:      pb.ActionType_ACTION_TYPE_CONCEDE,
+		PlayerId:  playerID,
+		Timestamp: time.Now().UnixNano() / int64(time.Millisecond),
+	}
+	result, _ := g.validateAndApplyAction(action)
+	return result
+}
+
+func (g *GameInstance) handleRollback(snap *lockstep.GameSnapshot, reason pb.RollbackReason) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.rollbackInProgress = true
+	defer func() { g.rollbackInProgress = false }()
+
+	g.lockstep.RestoreFromSnapshot(snap)
+
+	rollbackCmd := &pb.RollbackCommand{
+		RollbackToFrame: snap.FrameNumber,
+		RollbackHash:    snap.Hash,
+		Snapshot:        g.lockstep.ConvertToProtoSnapshot(snap),
+		Reason:          reason,
+		Message:         fmt.Sprintf("Rollback requested: %v", reason),
+	}
+
+	frame := &pb.GameFrame{
+		FrameNumber:      snap.FrameNumber,
+		Status:           snap.Status,
+		SnapshotInterval: SnapshotIntervalMs,
+		LatestSnapshot:   g.lockstep.ConvertToProtoSnapshot(snap),
+		Rollback:         rollbackCmd,
+	}
+
+	g.broadcastFrameNoLock(frame)
+}
+
+func (g *GameInstance) handleSnapshotCreated(snap *lockstep.GameSnapshot) {
+}
+
+func (g *GameInstance) handleDesync(playerID string, expected, actual uint64) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	g.World.EmitEvent("desync_detected", map[string]interface{}{
+		"player_id":    playerID,
+		"expected_hash": expected,
+		"actual_hash":   actual,
+	}, nil)
+}
+
+func (g *GameInstance) buildInternalStatus() *pb.GameStatus {
+	return g.buildGameStatus("")
+}
+
+func (g *GameInstance) GetGameState(playerID string) *pb.GameStatus {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.buildGameStatus(playerID)
+}
+
+func (g *GameInstance) GetSnapshot(frameNumber uint64) (*pb.GameSnapshot, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	snap, ok := g.lockstep.GetSnapshot(frameNumber)
+	if !ok {
+		return nil, false
+	}
+	return g.lockstep.ConvertToProtoSnapshot(snap), true
+}
+
+func (g *GameInstance) GetCurrentSnapshot() *pb.GameSnapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.lockstep.ConvertToProtoSnapshot(g.lockstep.GetCurrentSnapshot())
+}
+
+func (g *GameInstance) GetLatestFrame() uint64 {
+	return g.lockstep.GetLatestSnapshotFrame()
+}
+
+func (g *GameInstance) ReceiveAck(ack *pb.FrameAck) {
+	g.lockstep.ReceiveAck(ack)
+}
+
+func (g *GameInstance) GetPlayerNextSeq(playerID string) uint64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	acks := g.lockstep.GetAllPlayerAcks()
+	return acks[playerID] + 1
 }
 
 func (g *GameInstance) buildGameStatus(playerID string) *pb.GameStatus {
@@ -254,16 +686,27 @@ func (g *GameInstance) buildGameStatus(playerID string) *pb.GameStatus {
 		}
 	}
 
+	currentSnap := g.lockstep.GetCurrentSnapshot()
+	snapFrame := uint64(0)
+	snapHash := uint64(0)
+	if currentSnap != nil {
+		snapFrame = currentSnap.FrameNumber
+		snapHash = currentSnap.Hash
+	}
+
 	return &pb.GameStatus{
-		GameId:             g.GameID,
-		State:              pb.GameState(state.State),
-		Turn:               int32(state.Turn),
+		GameId:              g.GameID,
+		State:               pb.GameState(state.State),
+		Turn:                int32(state.Turn),
 		CurrentTurnPlayerId: state.CurrentTurn,
-		Phase:              pb.TurnPhase(state.Phase),
-		FrameNumber:        state.FrameNumber,
-		Winner:             state.Winner,
-		Players:            players,
-		Cards:              cards,
+		Phase:               pb.TurnPhase(state.Phase),
+		FrameNumber:         state.FrameNumber,
+		Winner:              state.Winner,
+		Players:             players,
+		Cards:               cards,
+		SnapshotFrame:       snapFrame,
+		SnapshotHash:        snapHash,
+		Timestamp:           time.Now().UnixNano() / int64(time.Millisecond),
 	}
 }
 
@@ -274,6 +717,7 @@ func (g *GameInstance) buildPlayer(player *ecs.Entity, viewerID string) *pb.Play
 	handComp, _ := player.GetComponent("hand").(*components.HandComponent)
 	boardComp, _ := player.GetComponent("board").(*components.BoardComponent)
 	deckComp, _ := player.GetComponent("deck").(*components.DeckComponent)
+	fatigueComp, _ := player.GetComponent("fatigue").(*components.FatigueComponent)
 
 	p := &pb.Player{
 		PlayerId:   playerComp.PlayerID,
@@ -286,9 +730,13 @@ func (g *GameInstance) buildPlayer(player *ecs.Entity, viewerID string) *pb.Play
 		Attack:     int32(heroComp.Attack),
 		DeckSize:   int32(len(deckComp.Cards)),
 		Weapon:     uint64(heroComp.Weapon),
+		LastAckFrame: g.lockstep.GetPlayerAck(playerComp.PlayerID),
+	}
+	if fatigueComp != nil {
+		p.FatigueCounter = int32(fatigueComp.Counter)
 	}
 
-	if playerComp.PlayerID == viewerID {
+	if playerComp.PlayerID == viewerID || viewerID == "" {
 		p.Hand = make([]uint64, len(handComp.Cards))
 		for i, id := range handComp.Cards {
 			p.Hand[i] = uint64(id)
@@ -311,21 +759,28 @@ func (g *GameInstance) buildPlayer(player *ecs.Entity, viewerID string) *pb.Play
 func (g *GameInstance) buildCard(card *ecs.Entity, viewerID string) *pb.Card {
 	cardComp, _ := card.GetComponent("card").(*components.CardComponent)
 	ownerComp, _ := card.GetComponent("owner").(*components.OwnerComponent)
+	boardPos := int32(-1)
 
-	c := &pb.Card{
-		EntityId:   uint64(card.ID),
-		CardId:     cardComp.CardID,
-		TemplateId: cardComp.TemplateID,
-		Type:       pb.CardType(cardComp.Type),
-		Cost:       int32(cardComp.Cost),
-		Name:       cardComp.Name,
-		Description: cardComp.Description,
-		Rarity:     cardComp.Rarity,
+	if minionComp, ok := card.GetComponent("board_position"); ok {
+		if bp, ok2 := minionComp.(*components.BoardPositionComponent); ok2 {
+			boardPos = int32(bp.Position)
+		}
 	}
 
-	if ownerComp.PlayerID != viewerID {
-		if handComp, ok := card.GetComponent("hand"); ok {
-			_ = handComp
+	c := &pb.Card{
+		EntityId:      uint64(card.ID),
+		CardId:        cardComp.CardID,
+		TemplateId:    cardComp.TemplateID,
+		Type:          pb.CardType(cardComp.CardType),
+		Cost:          int32(cardComp.Cost),
+		Name:          cardComp.Name,
+		Description:   cardComp.Description,
+		Rarity:        cardComp.Rarity,
+		BoardPosition: boardPos,
+	}
+
+	if ownerComp.PlayerID != viewerID && viewerID != "" {
+		if _, ok := card.GetComponent("hand"); ok {
 			c.Name = "???"
 			c.Description = ""
 			c.Type = pb.CardType_CARD_TYPE_UNSPECIFIED
@@ -334,7 +789,7 @@ func (g *GameInstance) buildCard(card *ecs.Entity, viewerID string) *pb.Card {
 		}
 	}
 
-	switch cardComp.Type {
+	switch cardComp.CardType {
 	case components.CardTypeMinion:
 		if minionComp, ok := card.GetComponent("minion").(*components.MinionComponent); ok {
 			c.Attack = int32(minionComp.Attack)
@@ -343,6 +798,9 @@ func (g *GameInstance) buildCard(card *ecs.Entity, viewerID string) *pb.Card {
 			c.CanAttack = minionComp.CanAttack
 			c.Taunt = minionComp.Taunt
 			c.Charge = minionComp.Charge
+			if ds, ok := card.GetComponent("divine_shield"); ok && ds != nil {
+				c.DivineShield = true
+			}
 		}
 	case components.CardTypeSpell:
 		if spellComp, ok := card.GetComponent("spell").(*components.SpellComponent); ok {
@@ -382,12 +840,15 @@ func (g *GameInstance) Subscribe(playerID string) chan *pb.GameFrame {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	ch := make(chan *pb.GameFrame, 100)
+	ch := make(chan *pb.GameFrame, 256)
 	g.streams[playerID] = ch
 
+	currentSnap := g.lockstep.GetCurrentSnapshot()
 	initialFrame := &pb.GameFrame{
-		FrameNumber: g.getFrameNumber(),
-		Status:      g.buildGameStatus(playerID),
+		FrameNumber:      g.GetLatestFrame(),
+		Status:           g.buildGameStatus(playerID),
+		SnapshotInterval: SnapshotIntervalMs,
+		LatestSnapshot:   g.lockstep.ConvertToProtoSnapshot(currentSnap),
 	}
 	ch <- initialFrame
 
@@ -426,6 +887,8 @@ func (g *GameInstance) GetTurns() int {
 }
 
 func (g *GameInstance) Close() {
+	g.cancel()
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -433,5 +896,13 @@ func (g *GameInstance) Close() {
 		close(ch)
 		delete(g.streams, playerID)
 	}
+	if g.aiAgent != nil {
+		g.aiAgent.Close()
+		g.aiAgent = nil
+	}
 	g.World.Close()
+}
+
+func (g *GameInstance) SnapshotInterval() uint64 {
+	return SnapshotIntervalMs
 }

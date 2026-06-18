@@ -25,7 +25,7 @@ type CardComponent struct {
 	ecs.BaseComponent
 	CardID          string
 	TemplateID      string
-	Type            CardType
+	CardType        CardType
 	Cost            int
 	Name            string
 	Description     string
