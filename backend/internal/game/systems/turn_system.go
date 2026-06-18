@@ -33,7 +33,7 @@ func (s *TurnSystem) StartGame(world *ecs.World, player1ID, player2ID string, pl
 	player1 := s.createPlayer(world, player1ID, player1Name, false)
 	player2 := s.createPlayer(world, player2ID, player2Name, false)
 
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	drawSystem := NewDrawSystem()
 
 	templates1 := s.generateDeck()

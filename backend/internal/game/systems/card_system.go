@@ -1,6 +1,7 @@
 package systems
 
 import (
+	"github.com/ecscard/game/internal/balance"
 	"github.com/ecscard/game/internal/ecs"
 	"github.com/ecscard/game/internal/game/components"
 	"github.com/google/uuid"
@@ -8,10 +9,13 @@ import (
 
 type CardSystem struct {
 	ecs.BaseSystem
+	registry *balance.BalancedCardRegistry
 }
 
-func NewCardSystem() *CardSystem {
-	return &CardSystem{}
+func NewCardSystem(registry *balance.BalancedCardRegistry) *CardSystem {
+	return &CardSystem{
+		registry: registry,
+	}
 }
 
 func (s *CardSystem) Name() string { return "card_system" }
@@ -35,57 +39,76 @@ func (s *CardSystem) cleanupDeadCards(world *ecs.World) {
 func (s *CardSystem) CreateCard(world *ecs.World, template *CardTemplate, ownerID string) *ecs.Entity {
 	entity := ecs.NewEntity()
 
-	cardComp := &components.CardComponent{
-		CardID:      uuid.New().String(),
-		TemplateID:  template.ID,
-		Type:        template.Type,
-		Cost:        template.Cost,
-		Name:        template.Name,
-		Description: template.Description,
-		Rarity:      template.Rarity,
+	var cardComp *components.CardComponent
+	var minionComp *components.MinionComponent
+	var spellComp *components.SpellComponent
+	var weaponComp *components.WeaponComponent
+
+	if s.registry != nil {
+		cardComp, minionComp, spellComp, weaponComp = s.registry.CreateCardComponents(template.ID)
+	}
+
+	if cardComp == nil {
+		cardComp = &components.CardComponent{
+			CardID:      uuid.New().String(),
+			TemplateID:  template.ID,
+			CardType:    template.Type,
+			Cost:        template.Cost,
+			Name:        template.Name,
+			Description: template.Description,
+			Rarity:      template.Rarity,
+		}
+	} else {
+		cardComp.CardID = uuid.New().String()
 	}
 	entity.AddComponent(cardComp)
 	entity.AddComponent(&components.OwnerComponent{PlayerID: ownerID})
 
 	switch template.Type {
 	case components.CardTypeMinion:
-		minionComp := &components.MinionComponent{
-			Attack:     template.Attack,
-			Health:     template.Health,
-			MaxHealth:  template.Health,
-			CanAttack:  template.Charge,
-			MaxAttacks: 1,
-			Taunt:      template.Taunt,
-			Charge:     template.Charge,
+		if minionComp == nil {
+			minionComp = &components.MinionComponent{
+				Attack:     template.Attack,
+				Health:     template.Health,
+				MaxHealth:  template.Health,
+				CanAttack:  template.Charge,
+				MaxAttacks: 1,
+				Taunt:      template.Taunt,
+				Charge:     template.Charge,
+			}
 		}
 		entity.AddComponent(minionComp)
 		entity.AddComponent(&ecs.HealthComponent{
-			CurrentHP: template.Health,
-			MaxHP:     template.Health,
+			CurrentHP: minionComp.Health,
+			MaxHP:     minionComp.MaxHealth,
 		})
 		entity.AddComponent(&ecs.AttackComponent{
-			AttackPower: template.Attack,
+			AttackPower: minionComp.Attack,
 		})
 
 	case components.CardTypeSpell:
-		spellComp := &components.SpellComponent{
-			Effect:     template.Effect,
-			Value:      template.Value,
-			TargetType: template.TargetType,
-			AOE:        template.AOE,
+		if spellComp == nil {
+			spellComp = &components.SpellComponent{
+				Effect:     template.Effect,
+				Value:      template.Value,
+				TargetType: template.TargetType,
+				AOE:        template.AOE,
+			}
 		}
 		entity.AddComponent(spellComp)
 
 	case components.CardTypeWeapon:
-		weaponComp := &components.WeaponComponent{
-			Attack:        template.Attack,
-			Durability:    template.Durability,
-			MaxDurability: template.Durability,
-			Equipped:      false,
+		if weaponComp == nil {
+			weaponComp = &components.WeaponComponent{
+				Attack:        template.Attack,
+				Durability:    template.Durability,
+				MaxDurability: template.Durability,
+				Equipped:      false,
+			}
 		}
 		entity.AddComponent(weaponComp)
 		entity.AddComponent(&ecs.AttackComponent{
-			AttackPower: template.Attack,
+			AttackPower: weaponComp.Attack,
 		})
 	}
 

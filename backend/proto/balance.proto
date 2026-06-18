@@ -1,0 +1,151 @@
+syntax = "proto3";
+
+package balance.v1;
+
+option go_package = "github.com/ecscard/game/internal/proto";
+
+enum CardBalanceTier {
+  CARD_BALANCE_TIER_UNSPECIFIED = 0;
+  CARD_BALANCE_TIER_S = 1;
+  CARD_BALANCE_TIER_A = 2;
+  CARD_BALANCE_TIER_B = 3;
+  CARD_BALANCE_TIER_C = 4;
+  CARD_BALANCE_TIER_D = 5;
+  CARD_BALANCE_TIER_F = 6;
+}
+
+message CardBalanceStats {
+  string template_id = 1;
+  string card_name = 2;
+  string card_type = 3;
+  int32 card_cost = 4;
+  int64 total_usage = 5;
+  int64 wins = 6;
+  int64 losses = 7;
+  double win_rate = 8;
+  double play_rate = 9;
+  int64 ban_count = 10;
+  double ban_rate = 11;
+  double synergy_score = 12;
+  double counter_score = 13;
+  CardBalanceTier tier = 14;
+  double delta_win_rate_7d = 15;
+  double delta_play_rate_7d = 16;
+  int64 sample_size = 17;
+  int64 last_updated_unix_ms = 18;
+}
+
+message CardTemplateOverride {
+  string template_id = 1;
+  map<string, double> numeric_overrides = 10;
+  string change_reason = 11;
+  string changed_by = 12;
+  int64 effective_from_unix_ms = 13;
+  bool is_active = 14;
+}
+
+message CardBalanceChangeLog {
+  string change_id = 1;
+  string template_id = 2;
+  string card_name = 3;
+  int64 timestamp_unix_ms = 4;
+  string changed_by = 5;
+  string change_reason = 6;
+  map<string, double> values_before = 7;
+  map<string, double> values_after = 8;
+  CardBalanceStats stats_before = 9;
+  CardBalanceStats stats_after = 10;
+  double predicted_impact = 11;
+  double actual_impact_24h = 12;
+}
+
+message HotUpdateRequest {
+  string template_id = 1;
+  map<string, double> numeric_overrides = 2;
+  string change_reason = 3;
+  string changed_by = 4;
+  bool immediate = 5;
+}
+
+message HotUpdateResponse {
+  bool success = 1;
+  string change_id = 2;
+  string template_id = 3;
+  int64 effective_time_unix_ms = 4;
+  CardBalanceChangeLog change_log = 5;
+}
+
+message GetBalanceStatsRequest {
+  int32 time_range_days = 1;
+  repeated string template_ids = 2;
+  string game_type = 3;
+  int32 min_rank = 4;
+  int32 max_rank = 5;
+  string sort_by = 6;
+  string sort_order = 7;
+  int32 page = 8;
+  int32 page_size = 9;
+}
+
+message GetBalanceStatsResponse {
+  repeated CardBalanceStats stats = 1;
+  int32 total_cards = 2;
+  int32 sample_size_total = 3;
+  string generated_at = 4;
+  repeated string tier_distribution = 5;
+}
+
+message GetBalanceHistoryRequest {
+  string template_id = 1;
+  int32 limit = 2;
+  int64 from_unix_ms = 3;
+  int64 to_unix_ms = 4;
+}
+
+message GetBalanceHistoryResponse {
+  repeated CardBalanceChangeLog changes = 1;
+}
+
+message GetActiveOverridesRequest {
+  string template_id = 1;
+}
+
+message GetActiveOverridesResponse {
+  repeated CardTemplateOverride overrides = 1;
+}
+
+message RevertHotUpdateRequest {
+  string change_id = 1;
+  string reverted_by = 2;
+}
+
+message RevertHotUpdateResponse {
+  bool success = 1;
+  string revert_change_id = 2;
+}
+
+message GetTierDistributionRequest {
+  int32 time_range_days = 1;
+}
+
+message TierDistribution {
+  CardBalanceTier tier = 1;
+  int32 count = 2;
+  double percentage = 3;
+  double avg_win_rate = 4;
+  double avg_play_rate = 5;
+}
+
+message GetTierDistributionResponse {
+  repeated TierDistribution tiers = 1;
+  int64 total_sample_size = 2;
+}
+
+service BalanceService {
+  rpc GetBalanceStats(GetBalanceStatsRequest) returns (GetBalanceStatsResponse);
+  rpc GetBalanceHistory(GetBalanceHistoryRequest) returns (GetBalanceHistoryResponse);
+  rpc GetActiveOverrides(GetActiveOverridesRequest) returns (GetActiveOverridesResponse);
+  rpc HotUpdateCard(HotUpdateRequest) returns (HotUpdateResponse);
+  rpc RevertHotUpdate(RevertHotUpdateRequest) returns (RevertHotUpdateResponse);
+  rpc GetTierDistribution(GetTierDistributionRequest) returns (GetTierDistributionResponse);
+}

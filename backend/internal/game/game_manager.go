@@ -2,20 +2,30 @@ package game
 
 import (
 	"context"
+	"log"
 	"sync"
 
+	"github.com/ecscard/game/internal/balance"
 	"github.com/ecscard/game/internal/cache"
+	"github.com/ecscard/game/internal/game/systems"
 	"github.com/ecscard/game/internal/mongodb"
 	"github.com/ecscard/game/internal/redis"
+	"github.com/ecscard/game/internal/replay"
 	"github.com/google/uuid"
 )
 
 type GameManager struct {
-	games        map[string]*GameInstance
-	mu           sync.RWMutex
-	cacheManager *cache.CacheManager
-	redisStore   *redis.StateStore
-	mongoStore   *mongodb.Store
+	games           map[string]*GameInstance
+	mu              sync.RWMutex
+	cacheManager    *cache.CacheManager
+	redisStore      *redis.StateStore
+	mongoStore      *mongodb.Store
+	replayStore     *replay.ReplayStore
+	specMgr         *replay.SpectatorManager
+	statsCollector  *balance.StatsCollector
+	hotUpdateMgr    *balance.HotUpdateManager
+	changeLogStore  *balance.ChangeLogStore
+	balanceRegistry *balance.BalancedCardRegistry
 }
 
 func NewGameManager(redisAddr string, redisPassword string, redisDB int, mongoURI string, useCluster bool, clusterAddrs []string) (*GameManager, error) {
@@ -37,11 +47,54 @@ func NewGameManager(redisAddr string, redisPassword string, redisDB int, mongoUR
 		return nil, err
 	}
 
+	replayStore, err := replay.NewReplayStore(mongoURI, "cardgame")
+	if err != nil {
+		log.Printf("[GameManager] Warning: failed to init ReplayStore: %v", err)
+		replayStore = nil
+	}
+
+	hotUpdateMgr, err := balance.NewHotUpdateManager(mongoURI, "cardgame")
+	if err != nil {
+		log.Printf("[GameManager] Warning: failed to init HotUpdateManager: %v", err)
+		hotUpdateMgr = nil
+	}
+	if hotUpdateMgr != nil {
+		if err := hotUpdateMgr.LoadOverridesFromDB(); err != nil {
+			log.Printf("[GameManager] Warning: failed to load overrides from DB: %v", err)
+		}
+	}
+
+	changeLogStore, err := balance.NewChangeLogStore(mongoURI, "cardgame")
+	if err != nil {
+		log.Printf("[GameManager] Warning: failed to init ChangeLogStore: %v", err)
+		changeLogStore = nil
+	}
+
+	statsCollector, err := balance.NewStatsCollector(mongoURI, "cardgame", hotUpdateMgr)
+	if err != nil {
+		log.Printf("[GameManager] Warning: failed to init StatsCollector: %v", err)
+		statsCollector = nil
+	}
+
+	var specMgr *replay.SpectatorManager
+	if replayStore != nil {
+		specMgr = replay.NewSpectatorManager(replayStore)
+	}
+
+	balanceRegistry := balance.NewBalancedCardRegistry(hotUpdateMgr)
+	balanceRegistry.InitFromDefaultTemplates(CardTemplates)
+
 	gm := &GameManager{
-		games:        make(map[string]*GameInstance),
-		cacheManager: cacheManager,
-		redisStore:   redisStore,
-		mongoStore:   mongoStore,
+		games:           make(map[string]*GameInstance),
+		cacheManager:    cacheManager,
+		redisStore:      redisStore,
+		mongoStore:      mongoStore,
+		replayStore:     replayStore,
+		specMgr:         specMgr,
+		statsCollector:  statsCollector,
+		hotUpdateMgr:    hotUpdateMgr,
+		changeLogStore:  changeLogStore,
+		balanceRegistry: balanceRegistry,
 	}
 
 	return gm, nil
@@ -65,7 +118,7 @@ func (gm *GameManager) CreateGame(matchID, player1ID, player2ID, player1Name, pl
 		return nil, err
 	}
 
-	game := NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name, isAI, aiDifficulty)
+	game := NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name, isAI, aiDifficulty, gm.replayStore, gm.statsCollector, gm.balanceRegistry)
 
 	gm.mu.Lock()
 	gm.games[gameID] = game
@@ -86,6 +139,8 @@ func (gm *GameManager) monitorGame(game *GameInstance) {
 }
 
 func (gm *GameManager) handleGameEnd(game *GameInstance) {
+	game.HandleGameEndInternal()
+
 	winnerID := game.GetWinner()
 	loserID := game.Player1ID
 	if winnerID == game.Player1ID {
@@ -126,6 +181,8 @@ func (gm *GameManager) MarkGameEnded(gameID, winnerID string, turns int, duratio
 	if !ok {
 		return
 	}
+
+	game.HandleGameEndInternal()
 
 	loserID := game.Player1ID
 	if winnerID == game.Player1ID {
@@ -187,6 +244,30 @@ func (gm *GameManager) GetActiveGames() []*GameInstance {
 	return games
 }
 
+func (gm *GameManager) GetReplayStore() *replay.ReplayStore {
+	return gm.replayStore
+}
+
+func (gm *GameManager) GetSpecMgr() *replay.SpectatorManager {
+	return gm.specMgr
+}
+
+func (gm *GameManager) GetStatsCollector() *balance.StatsCollector {
+	return gm.statsCollector
+}
+
+func (gm *GameManager) GetHotUpdateMgr() *balance.HotUpdateManager {
+	return gm.hotUpdateMgr
+}
+
+func (gm *GameManager) GetChangeLogStore() *balance.ChangeLogStore {
+	return gm.changeLogStore
+}
+
+func (gm *GameManager) GetBalanceRegistry() *balance.BalancedCardRegistry {
+	return gm.balanceRegistry
+}
+
 func (gm *GameManager) Close() {
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
@@ -196,7 +277,25 @@ func (gm *GameManager) Close() {
 	}
 	gm.games = make(map[string]*GameInstance)
 
+	ctx := context.Background()
+
+	if gm.changeLogStore != nil {
+		_ = gm.changeLogStore.Close(ctx)
+	}
+	if gm.statsCollector != nil {
+		_ = gm.statsCollector.Close(ctx)
+	}
+	if gm.hotUpdateMgr != nil {
+		_ = gm.hotUpdateMgr.Close(ctx)
+	}
+	if gm.replayStore != nil {
+		_ = gm.replayStore.Close(ctx)
+	}
+	if gm.specMgr != nil {
+		gm.specMgr.Close()
+	}
+
 	gm.cacheManager.Close()
 	gm.redisStore.Close()
-	gm.mongoStore.Close(context.Background())
+	gm.mongoStore.Close(ctx)
 }

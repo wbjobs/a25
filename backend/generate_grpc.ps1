@@ -11,7 +11,9 @@ if (-not (Test-Path $goOutPath)) {
 
 $protoFiles = @(
     "game.proto",
-    "matchmaking.proto"
+    "matchmaking.proto",
+    "replay.proto",
+    "balance.proto"
 )
 
 foreach ($protoFile in $protoFiles) {

@@ -11,7 +11,7 @@ import (
 func TestTurnSystem_StartGame(t *testing.T) {
 	world := ecs.NewWorld()
 	turnSystem := NewTurnSystem()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 
 	world.AddSystem(turnSystem)
 	world.AddSystem(cardSystem)
@@ -60,7 +60,7 @@ func TestTurnSystem_StartGame(t *testing.T) {
 func TestTurnSystem_EndTurn(t *testing.T) {
 	world := ecs.NewWorld()
 	turnSystem := NewTurnSystem()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 	drawSystem := NewDrawSystem()
 
@@ -90,7 +90,7 @@ func TestTurnSystem_EndTurn(t *testing.T) {
 func TestTurnSystem_MultipleTurns(t *testing.T) {
 	world := ecs.NewWorld()
 	turnSystem := NewTurnSystem()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 
 	world.AddSystem(turnSystem)
 	world.AddSystem(cardSystem)
@@ -115,7 +115,7 @@ func TestTurnSystem_MultipleTurns(t *testing.T) {
 func TestTurnSystem_GameOver_HeroDeath(t *testing.T) {
 	world := ecs.NewWorld()
 	turnSystem := NewTurnSystem()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 
 	world.AddSystem(turnSystem)
@@ -142,7 +142,7 @@ func TestTurnSystem_GameOver_HeroDeath(t *testing.T) {
 func TestTurnSystem_FatigueDamage(t *testing.T) {
 	world := ecs.NewWorld()
 	turnSystem := NewTurnSystem()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	drawSystem := NewDrawSystem()
 
 	world.AddSystem(turnSystem)

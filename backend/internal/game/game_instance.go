@@ -3,15 +3,18 @@ package game
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/ecscard/game/internal/ai"
+	"github.com/ecscard/game/internal/balance"
 	"github.com/ecscard/game/internal/ecs"
 	"github.com/ecscard/game/internal/game/components"
 	"github.com/ecscard/game/internal/game/systems"
 	"github.com/ecscard/game/internal/lockstep"
+	"github.com/ecscard/game/internal/replay"
 	pb "github.com/ecscard/game/internal/proto"
 )
 
@@ -50,6 +53,11 @@ type GameInstance struct {
 	aiPlayerID   string
 	aiThinking   bool
 
+	replayRecorder  *replay.ReplayRecorder
+	statsCollector  *balance.StatsCollector
+	balanceRegistry *balance.BalancedCardRegistry
+	replayStore     *replay.ReplayStore
+
 	mu sync.RWMutex
 
 	streams      map[string]chan *pb.GameFrame
@@ -57,7 +65,7 @@ type GameInstance struct {
 
 	lockstep *lockstep.LockstepEngine
 
-	confirmedActions map[uint64][]ActionWithValid
+	confirmedActions   map[uint64][]ActionWithValid
 	rollbackInProgress bool
 	lastSnapshotFrame  uint64
 
@@ -65,10 +73,10 @@ type GameInstance struct {
 	cancel context.CancelFunc
 }
 
-func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name string, isAI bool, aiDifficulty string) *GameInstance {
+func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2Name string, isAI bool, aiDifficulty string, replayStore *replay.ReplayStore, statsCollector *balance.StatsCollector, balanceRegistry *balance.BalancedCardRegistry) *GameInstance {
 	world := ecs.NewWorld()
 
-	cardSystem := systems.NewCardSystem()
+	cardSystem := systems.NewCardSystem(balanceRegistry)
 	drawSystem := systems.NewDrawSystem()
 	combatSystem := systems.NewCombatSystem()
 	turnSystem := systems.NewTurnSystem()
@@ -81,24 +89,31 @@ func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2
 	ctx, cancel := context.WithCancel(context.Background())
 
 	gi := &GameInstance{
-		GameID:       gameID,
-		MatchID:      matchID,
-		World:        world,
-		CardSystem:   cardSystem,
-		DrawSystem:   drawSystem,
-		CombatSystem: combatSystem,
-		TurnSystem:   turnSystem,
-		Player1ID:    player1ID,
-		Player2ID:    player2ID,
-		Player1Name:  player1Name,
-		Player2Name:  player2Name,
-		CreatedAt:    time.Now(),
-		IsAIGame:     isAI,
-		AIDifficulty: aiDifficulty,
-		streams:      make(map[string]chan *pb.GameFrame),
+		GameID:           gameID,
+		MatchID:          matchID,
+		World:            world,
+		CardSystem:       cardSystem,
+		DrawSystem:       drawSystem,
+		CombatSystem:     combatSystem,
+		TurnSystem:       turnSystem,
+		Player1ID:        player1ID,
+		Player2ID:        player2ID,
+		Player1Name:      player1Name,
+		Player2Name:      player2Name,
+		CreatedAt:        time.Now(),
+		IsAIGame:         isAI,
+		AIDifficulty:     aiDifficulty,
+		replayStore:      replayStore,
+		statsCollector:   statsCollector,
+		balanceRegistry:  balanceRegistry,
+		streams:          make(map[string]chan *pb.GameFrame),
 		confirmedActions: make(map[uint64][]ActionWithValid),
-		ctx:          ctx,
-		cancel:       cancel,
+		ctx:              ctx,
+		cancel:           cancel,
+	}
+
+	if replayStore != nil {
+		gi.replayRecorder = replay.NewReplayRecorder(gameID, matchID, player1ID, player1Name, player2ID, player2Name, replayStore)
 	}
 
 	gi.lockstep = lockstep.NewLockstepEngine(gameID, world)
@@ -133,8 +148,26 @@ func NewGameInstance(gameID, matchID, player1ID, player2ID, player1Name, player2
 	gi.StartedAt = time.Now()
 
 	initialStatus := gi.buildInternalStatus()
-	_ = gi.lockstep.GenerateSnapshot(initialStatus)
+	initialSnap := gi.lockstep.GenerateSnapshot(initialStatus)
 	gi.lastSnapshotFrame = 1
+
+	if gi.replayRecorder != nil {
+		protoSnap := &pb.GameSnapshot{
+			FrameNumber: initialSnap.FrameNumber,
+			Hash:        initialSnap.Hash,
+			Status:      initialSnap.Status,
+		}
+		gi.replayRecorder.SetInitialSnapshot(protoSnap)
+		if replayStore != nil {
+			replayStore.RegisterLiveGame(gi.replayRecorder)
+		}
+	}
+
+	if balanceRegistry != nil {
+		balanceRegistry.AddUpdateListener(func(tplID string) {
+			log.Printf("[BalanceRegistry] Hot update received for template: %s", tplID)
+		})
+	}
 
 	go gi.startGameLoop()
 	go gi.snapshotLoop()
@@ -477,7 +510,11 @@ func (g *GameInstance) applyPlayCard(action *pb.Action) bool {
 		return false
 	}
 
-	return g.CombatSystem.PlayCard(g.World, player, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
+	result := g.CombatSystem.PlayCard(g.World, player, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
+	if result {
+		g.RecordActionToReplay(action)
+	}
+	return result
 }
 
 func (g *GameInstance) applyAttack(action *pb.Action) bool {
@@ -485,11 +522,19 @@ func (g *GameInstance) applyAttack(action *pb.Action) bool {
 		return false
 	}
 
-	return g.CombatSystem.Attack(g.World, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
+	result := g.CombatSystem.Attack(g.World, ecs.EntityID(action.CardId), ecs.EntityID(action.TargetId))
+	if result {
+		g.RecordActionToReplay(action)
+	}
+	return result
 }
 
 func (g *GameInstance) applyEndTurn(action *pb.Action) bool {
-	return g.TurnSystem.EndTurn(g.World, action.PlayerId)
+	result := g.TurnSystem.EndTurn(g.World, action.PlayerId)
+	if result {
+		g.RecordActionToReplay(action)
+	}
+	return result
 }
 
 func (g *GameInstance) applyConcede(action *pb.Action) bool {
@@ -520,6 +565,9 @@ func (g *GameInstance) applyConcede(action *pb.Action) bool {
 		"player_id": action.PlayerId,
 		"winner_id": opponentID,
 	}, nil)
+
+	g.RecordActionToReplay(action)
+	g.HandleGameEndInternal()
 
 	return true
 }
@@ -886,8 +934,90 @@ func (g *GameInstance) GetTurns() int {
 	return 0
 }
 
+func (g *GameInstance) RecordActionToReplay(action *pb.Action) {
+	if g.replayRecorder == nil {
+		return
+	}
+
+	stateAfter := g.buildInternalStatus()
+
+	frameNum := uint64(0)
+	currentSnap := g.lockstep.GetCurrentSnapshot()
+	if currentSnap != nil {
+		frameNum = currentSnap.FrameNumber
+	}
+
+	events := make([]*pb.GameEvent, 0)
+
+	g.replayRecorder.RecordAction(action, stateAfter, events, frameNum)
+
+	if g.statsCollector != nil {
+		if action.Type == pb.ActionType_ACTION_TYPE_PLAY_CARD || action.Type == pb.ActionType_ACTION_TYPE_END_TURN {
+			templateID := ""
+			if cardEntity, ok := g.World.GetEntity(ecs.EntityID(action.CardId)); ok {
+				if cardComp, compOk := cardEntity.GetComponent("card").(*components.CardComponent); compOk {
+					templateID = cardComp.TemplateID
+				}
+			}
+			winnerID := g.GetWinner()
+			win := winnerID != "" && action.PlayerId == winnerID
+			g.statsCollector.RecordCardUsage(g.GameID, templateID, "normal", 0, win, true, false)
+		}
+	}
+}
+
+func (g *GameInstance) HandleGameEndInternal() {
+	winnerID := g.GetWinner()
+	totalTurns := int32(g.GetTurns())
+
+	if g.replayRecorder != nil {
+		g.replayRecorder.MarkFinished(winnerID, totalTurns)
+		if g.replayStore != nil {
+			g.replayStore.UnregisterLiveGame(g.GameID)
+		}
+	}
+
+	if g.statsCollector != nil {
+		status := g.buildInternalStatus()
+		playerDecks := make(map[string][]string)
+		playerRanks := make(map[string]int32)
+
+		if status != nil {
+			for _, p := range status.Players {
+				deckIDs := make([]string, 0)
+				if p.Hand != nil {
+					for _, cardID := range p.Hand {
+						if cardEntity, ok := g.World.GetEntity(ecs.EntityID(cardID)); ok {
+							if cardComp, compOk := cardEntity.GetComponent("card").(*components.CardComponent); compOk {
+								deckIDs = append(deckIDs, cardComp.TemplateID)
+							}
+						}
+					}
+				}
+				if p.Board != nil {
+					for _, cardID := range p.Board {
+						if cardEntity, ok := g.World.GetEntity(ecs.EntityID(cardID)); ok {
+							if cardComp, compOk := cardEntity.GetComponent("card").(*components.CardComponent); compOk {
+								deckIDs = append(deckIDs, cardComp.TemplateID)
+							}
+						}
+					}
+				}
+				playerDecks[p.PlayerId] = deckIDs
+				playerRanks[p.PlayerId] = 0
+			}
+		}
+
+		g.statsCollector.RecordGameResult(g.GameID, playerDecks, playerRanks, winnerID, "normal")
+	}
+}
+
 func (g *GameInstance) Close() {
 	g.cancel()
+
+	if !g.IsFinished() {
+		g.HandleGameEndInternal()
+	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()

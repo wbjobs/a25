@@ -10,7 +10,7 @@ import (
 
 func TestCombatSystem_PlayMinionCard(t *testing.T) {
 	world := ecs.NewWorld()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 	drawSystem := NewDrawSystem()
 	turnSystem := NewTurnSystem()
@@ -43,7 +43,7 @@ func TestCombatSystem_PlayMinionCard(t *testing.T) {
 
 func TestCombatSystem_PlaySpellCard_Damage(t *testing.T) {
 	world := ecs.NewWorld()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 	drawSystem := NewDrawSystem()
 	turnSystem := NewTurnSystem()
@@ -75,7 +75,7 @@ func TestCombatSystem_PlaySpellCard_Damage(t *testing.T) {
 
 func TestCombatSystem_Attack(t *testing.T) {
 	world := ecs.NewWorld()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 	drawSystem := NewDrawSystem()
 	turnSystem := NewTurnSystem()
@@ -123,7 +123,7 @@ func TestCombatSystem_Attack(t *testing.T) {
 
 func TestCombatSystem_TauntMechanic(t *testing.T) {
 	world := ecs.NewWorld()
-	cardSystem := NewCardSystem()
+	cardSystem := NewCardSystem(nil)
 	combatSystem := NewCombatSystem()
 	drawSystem := NewDrawSystem()
 	turnSystem := NewTurnSystem()

@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package replay.v1;
+
+option go_package = "github.com/ecscard/game/internal/proto";
+
+import "game.proto";
+
+enum ReplayPhase {
+  REPLAY_PHASE_UNSPECIFIED = 0;
+  REPLAY_PHASE_WAITING = 1;
+  REPLAY_PHASE_LIVE = 2;
+  REPLAY_PHASE_FINISHED = 3;
+}
+
+message ReplayMeta {
+  string game_id = 1;
+  string match_id = 2;
+  string player1_id = 3;
+  string player1_name = 4;
+  string player2_id = 5;
+  string player2_name = 6;
+  int64 start_time_unix_ms = 7;
+  int64 end_time_unix_ms = 8;
+  int32 total_turns = 9;
+  string winner_id = 10;
+  int64 duration_ms = 11;
+  int32 spectator_delay_ms = 12;
+  bool is_live = 13;
+  ReplayPhase phase = 14;
+  GameSnapshot initial_snapshot = 15;
+  int32 total_actions = 16;
+}
+
+message ReplayAction {
+  int64 relative_time_ms = 1;
+  uint64 frame_number = 2;
+  Action action = 3;
+  GameStatus state_after = 4;
+  repeated GameEvent events = 5;
+}
+
+message ReplaySegment {
+  string game_id = 1;
+  int64 start_time_ms = 2;
+  int64 end_time_ms = 3;
+  int32 start_index = 4;
+  int32 end_index = 5;
+  repeated ReplayAction actions = 6;
+  bool has_more = 7;
+}
+
+message SpectatorJoinRequest {
+  string game_id = 1;
+  string spectator_id = 2;
+  string spectator_name = 3;
+}
+
+message SpectatorFrame {
+  int64 server_time_ms = 1;
+  int64 stream_time_ms = 2;
+  int32 spectator_count = 3;
+  ReplayPhase phase = 4;
+  oneof payload {
+    GameSnapshot full_snapshot = 5;
+    ReplayAction action = 6;
+    ReplaySegment segment = 7;
+    string chat_message = 8;
+  }
+}
+
+message SeekRequest {
+  string game_id = 2;
+  int64 target_time_ms = 3;
+  uint64 target_frame = 4;
+}
+
+message SeekResponse {
+  bool success = 1;
+  int64 current_time_ms = 2;
+  uint64 current_frame = 3;
+  GameSnapshot snapshot = 4;
+}
+
+message SetPlaybackSpeedRequest {
+  string spectator_id = 1;
+  string game_id = 2;
+  float speed = 3;
+}
+
+message SetPlaybackSpeedResponse {
+  bool success = 1;
+  float current_speed = 2;
+}
+
+message GetReplayMetaRequest {
+  string game_id = 1;
+}
+
+message GetReplaySegmentRequest {
+  string game_id = 1;
+  int64 from_time_ms = 2;
+  int64 to_time_ms = 3;
+  int32 from_index = 4;
+  int32 to_index = 5;
+}
+
+message ListLiveGamesRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+  string game_type = 3;
+}
+
+message LiveGameInfo {
+  string game_id = 1;
+  string player1_name = 2;
+  string player2_name = 3;
+  int32 player1_health = 4;
+  int32 player2_health = 5;
+  int32 current_turn = 6;
+  int32 spectator_count = 7;
+  int32 spectator_delay_ms = 8;
+  int64 elapsed_ms = 9;
+  string game_type = 10;
+}
+
+message ListLiveGamesResponse {
+  repeated LiveGameInfo games = 1;
+  int32 total = 2;
+}
+
+service ReplayService {
+  rpc JoinAsSpectator(SpectatorJoinRequest) returns (stream SpectatorFrame);
+  rpc SeekTo(SeekRequest) returns (SeekResponse);
+  rpc SetPlaybackSpeed(SetPlaybackSpeedRequest) returns (SetPlaybackSpeedResponse);
+  rpc GetReplayMeta(GetReplayMetaRequest) returns (ReplayMeta);
+  rpc GetReplaySegment(GetReplaySegmentRequest) returns (ReplaySegment);
+  rpc ListLiveGames(ListLiveGamesRequest) returns (ListLiveGamesResponse);
+}

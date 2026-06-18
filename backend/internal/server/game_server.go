@@ -18,8 +18,8 @@ type GameServer struct {
 	serverAddr  string
 }
 
-func NewGameServer(redisAddr, mongoURI, serverAddr string, useCluster bool, clusterAddrs []string) (*GameServer, error) {
-	gm, err := game.NewGameManager(redisAddr, mongoURI, useCluster, clusterAddrs)
+func NewGameServer(redisAddr, redisPassword string, redisDB int, mongoURI, serverAddr string, useCluster bool, clusterAddrs []string) (*GameServer, error) {
+	gm, err := game.NewGameManager(redisAddr, redisPassword, redisDB, mongoURI, useCluster, clusterAddrs)
 	if err != nil {
 		return nil, err
 	}
@@ -28,6 +28,10 @@ func NewGameServer(redisAddr, mongoURI, serverAddr string, useCluster bool, clus
 		gameManager: gm,
 		serverAddr:  serverAddr,
 	}, nil
+}
+
+func (s *GameServer) GameManager() *game.GameManager {
+	return s.gameManager
 }
 
 func (s *GameServer) StartGame(ctx context.Context, req *pb.StartGameRequest) (*pb.StartGameResponse, error) {
